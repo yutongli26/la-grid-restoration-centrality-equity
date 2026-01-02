@@ -1,0 +1,172 @@
+2025-12-29 22:34:11,217 - INFO - Logging initialized.
+2025-12-29 22:34:11,217 - INFO - ======================================================================
+2025-12-29 22:34:11,217 - INFO - STARTING INTEGRATED EARTHQUAKE IMPACT PIPELINE
+2025-12-29 22:34:11,217 - INFO - Output Root Override: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale
+2025-12-29 22:34:11,217 - INFO - ======================================================================
+2025-12-29 22:34:11,217 - INFO - Output directory ensured: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 1 Output
+2025-12-29 22:34:11,217 - INFO - Output directory ensured: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 2 Output
+2025-12-29 22:34:11,217 - INFO - Output directory ensured: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 3 Output
+2025-12-29 22:34:11,217 - INFO - Output directory ensured: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output
+2025-12-29 22:34:11,217 - INFO - Output directory ensured: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 5 Output
+2025-12-29 22:34:11,217 - INFO - Output directory ensured: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 6 Output
+2025-12-29 22:34:11,217 - INFO - Output directory ensured: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 7 Output
+2025-12-29 22:34:11,217 - INFO - ==================================================
+2025-12-29 22:34:11,217 - INFO - --- STAGE 0: Load & Build ---
+2025-12-29 22:34:11,229 - INFO - Using 'HIFLD_ID' as primary device key.
+2025-12-29 22:34:11,231 - INFO - Loaded PGA data from C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Data\Substations_PGA_IDW_CEC.csv. Columns standardized.
+2025-12-29 22:34:11,252 - INFO - Loaded mapping: 12638 rows from C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Data\tract_to_substation_mapping_CEC.csv
+2025-12-29 22:34:11,252 - INFO - Merged devices + PGA: 50 rows.
+2025-12-29 22:34:11,252 - INFO - Building W matrix (tracts x substations)...
+2025-12-29 22:34:11,268 - INFO - W matrix built. Shape: (N_tracts: 1108, N_subs: 50)
+2025-12-29 22:34:11,271 - INFO - Devices aligned. Count: 50
+2025-12-29 22:34:11,271 - INFO - --- STAGE 0 Complete ---
+2025-12-29 22:34:11,272 - INFO - ==================================================
+2025-12-29 22:34:11,272 - INFO - --- STAGE 1: Fragility Sampling ---
+2025-12-29 22:34:11,273 - INFO - Running 300 MC simulations across 32 workers...
+2025-12-29 22:34:11,273 - INFO - Processing scenario: Northridge...
+2025-12-29 22:34:11,274 - INFO - PGA statistics for Northridge: mean=0.36, std=0.22, max=0.85
+2025-12-29 22:34:13,790 - INFO - Saved device records: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 1 Output\MC_Device_Damage_Records_Northridge.csv.gz
+2025-12-29 22:34:13,795 - INFO - Aggregated results for Northridge.
+2025-12-29 22:34:13,795 - INFO - Processing scenario: SanFernando...
+2025-12-29 22:34:13,803 - INFO - PGA statistics for SanFernando: mean=0.21, std=0.17, max=0.70
+2025-12-29 22:34:14,062 - INFO - Saved device records: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 1 Output\MC_Device_Damage_Records_SanFernando.csv.gz
+2025-12-29 22:34:14,062 - INFO - Aggregated results for SanFernando.
+2025-12-29 22:34:14,062 - INFO - Processing scenario: LongBeach...
+2025-12-29 22:34:14,076 - INFO - PGA statistics for LongBeach: mean=0.15, std=0.11, max=0.38
+2025-12-29 22:34:14,333 - INFO - Saved device records: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 1 Output\MC_Device_Damage_Records_LongBeach.csv.gz
+2025-12-29 22:34:14,339 - INFO - Aggregated results for LongBeach.
+2025-12-29 22:34:14,340 - INFO - --- STAGE 1 Complete ---
+2025-12-29 22:34:14,341 - INFO - ==================================================
+2025-12-29 22:34:14,341 - INFO - --- STAGE 2: Criticality & Percolation ---
+2025-12-29 22:34:14,342 - INFO - Loading prebuilt CEC edge list: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Data\substation_graph_CEC_edges.csv
+2025-12-29 22:34:14,351 - INFO - Attached lat/lon attributes to graph nodes.
+2025-12-29 22:34:14,351 - INFO - Loaded prebuilt CEC graph for Stage 2: 50 nodes, 198 edges from C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Data\substation_graph_CEC_edges.csv
+2025-12-29 22:34:14,374 - INFO - Computing algebraic-connectivity-based Impact Centrality for 50 nodes... (Base lambda2 = 0.2744)
+2025-12-29 22:34:14,469 - INFO - Computed algebraic-connectivity impact centrality. Found 37 structurally critical nodes (lambda2 loss > 0).
+2025-12-29 22:34:14,543 - INFO - Centrality metrics saved to C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 2 Output\impact_centrality_substations.csv
+2025-12-29 22:34:14,546 - INFO - Percolation curve saved to C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 2 Output\percolation_curve_impact.csv
+2025-12-29 22:34:14,550 - INFO - Percolation curve saved to C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 2 Output\percolation_curve_random.csv
+2025-12-29 22:34:14,550 - INFO - --- STAGE 2 Complete ---
+2025-12-29 22:34:14,550 - INFO - ==================================================
+2025-12-29 22:34:14,551 - INFO - --- STAGE 3: Step Recovery Simulation ---
+2025-12-29 22:34:14,551 - INFO - Processing scenario: Northridge...
+2025-12-29 22:34:14,551 - INFO - Simulating mean recovery curve for Northridge...
+2025-12-29 22:34:14,552 - INFO - Fixed t=0 state for 0 undamaged substations.
+2025-12-29 22:34:15,251 - INFO - OK Northridge: 1108 tracts saved. System T50: 15.0 hr, System T80: 28.0 hr.
+2025-12-29 22:34:15,251 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:15,321 - INFO - Saved dynamic graph robustness to C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 3 Output\graph_robustness_mean_Northridge.csv
+2025-12-29 22:34:15,321 - INFO - Processing scenario: SanFernando...
+2025-12-29 22:34:15,334 - INFO - Simulating mean recovery curve for SanFernando...
+2025-12-29 22:34:15,335 - INFO - Fixed t=0 state for 10 undamaged substations.
+2025-12-29 22:34:16,001 - INFO - OK SanFernando: 1108 tracts saved. System T50: 4.0 hr, System T80: 13.0 hr.
+2025-12-29 22:34:16,001 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:16,069 - INFO - Saved dynamic graph robustness to C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 3 Output\graph_robustness_mean_SanFernando.csv
+2025-12-29 22:34:16,069 - INFO - Processing scenario: LongBeach...
+2025-12-29 22:34:16,069 - INFO - Simulating mean recovery curve for LongBeach...
+2025-12-29 22:34:16,069 - INFO - Fixed t=0 state for 13 undamaged substations.
+2025-12-29 22:34:16,750 - INFO - OK LongBeach: 1108 tracts saved. System T50: 1.0 hr, System T80: 3.0 hr.
+2025-12-29 22:34:16,750 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:16,821 - INFO - Saved dynamic graph robustness to C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 3 Output\graph_robustness_mean_LongBeach.csv
+2025-12-29 22:34:16,821 - INFO - --- STAGE 3 Complete ---
+2025-12-29 22:34:16,821 - INFO - ==================================================
+2025-12-29 22:34:16,821 - INFO - --- STAGE 4: Rule-Based Baselines (Modified for SVI) ---
+2025-12-29 22:34:16,821 - INFO - SVI weights calculated successfully for analysis.
+2025-12-29 22:34:16,821 - INFO - Processing scenario: Northridge...
+2025-12-29 22:34:16,830 - INFO - [Travel] Loading Base->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_base_to_task.csv
+2025-12-29 22:34:16,833 - INFO - [Travel] Loading Task->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_task_to_task.csv
+2025-12-29 22:34:16,836 - INFO -    - Simulating rule: centrality-first
+2025-12-29 22:34:16,841 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:16,920 - INFO -    - Simulating rule: impact-first
+2025-12-29 22:34:16,928 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,007 - INFO -    - Simulating rule: betweenness-first
+2025-12-29 22:34:17,016 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,099 - INFO -    - Simulating rule: degree-first
+2025-12-29 22:34:17,108 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,189 - INFO -    - Simulating rule: closeness-first
+2025-12-29 22:34:17,199 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,279 - INFO -    - Simulating rule: hospital-first
+2025-12-29 22:34:17,301 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,368 - INFO -    - Simulating rule: random
+2025-12-29 22:34:17,368 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,469 - INFO - Wrote rule-based curves (Pop & SVI) to C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output for Northridge
+2025-12-29 22:34:17,470 - INFO - Processing scenario: SanFernando...
+2025-12-29 22:34:17,471 - INFO - [Travel] Loading Base->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_base_to_task.csv
+2025-12-29 22:34:17,474 - INFO - [Travel] Loading Task->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_task_to_task.csv
+2025-12-29 22:34:17,477 - INFO -    - Simulating rule: centrality-first
+2025-12-29 22:34:17,488 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,551 - INFO -    - Simulating rule: impact-first
+2025-12-29 22:34:17,572 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,646 - INFO -    - Simulating rule: betweenness-first
+2025-12-29 22:34:17,655 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,731 - INFO -    - Simulating rule: degree-first
+2025-12-29 22:34:17,740 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,816 - INFO -    - Simulating rule: closeness-first
+2025-12-29 22:34:17,824 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,893 - INFO -    - Simulating rule: hospital-first
+2025-12-29 22:34:17,921 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:17,984 - INFO -    - Simulating rule: random
+2025-12-29 22:34:18,001 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:18,082 - INFO - Wrote rule-based curves (Pop & SVI) to C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output for SanFernando
+2025-12-29 22:34:18,083 - INFO - Processing scenario: LongBeach...
+2025-12-29 22:34:18,084 - INFO - [Travel] Loading Base->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_base_to_task.csv
+2025-12-29 22:34:18,087 - INFO - [Travel] Loading Task->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_task_to_task.csv
+2025-12-29 22:34:18,089 - INFO -    - Simulating rule: centrality-first
+2025-12-29 22:34:18,098 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:18,163 - INFO -    - Simulating rule: impact-first
+2025-12-29 22:34:18,172 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:18,237 - INFO -    - Simulating rule: betweenness-first
+2025-12-29 22:34:18,246 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:18,314 - INFO -    - Simulating rule: degree-first
+2025-12-29 22:34:18,322 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:18,386 - INFO -    - Simulating rule: closeness-first
+2025-12-29 22:34:18,395 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:18,462 - INFO -    - Simulating rule: hospital-first
+2025-12-29 22:34:18,486 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:18,553 - INFO -    - Simulating rule: random
+2025-12-29 22:34:18,561 - INFO - Computing dynamic graph robustness (Metric: Average Degree)...
+2025-12-29 22:34:18,635 - INFO - Wrote rule-based curves (Pop & SVI) to C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output for LongBeach
+2025-12-29 22:34:18,635 - INFO - --- STAGE 4 Complete ---
+2025-12-29 22:34:18,636 - INFO - ==================================================
+2025-12-29 22:34:18,636 - INFO - --- STAGE 5: Genetic Algorithm Optimization (Evolutionary with Inversion Mutation) ---
+2025-12-29 22:34:18,645 - INFO - Running GA for Northridge...
+2025-12-29 22:34:18,647 - INFO - [Travel] Loading Base->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_base_to_task.csv
+2025-12-29 22:34:18,651 - INFO - [Travel] Loading Task->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_task_to_task.csv
+2025-12-29 22:34:19,488 - INFO -   > Gen 50 Best Fitness: 1.85e+09
+2025-12-29 22:34:19,501 - INFO - SVI weights calculated successfully for analysis.
+2025-12-29 22:34:19,502 - INFO - Running GA for SanFernando...
+2025-12-29 22:34:19,504 - INFO - [Travel] Loading Base->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_base_to_task.csv
+2025-12-29 22:34:19,504 - INFO - [Travel] Loading Task->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_task_to_task.csv
+2025-12-29 22:34:20,307 - INFO -   > Gen 50 Best Fitness: 1.90e+09
+2025-12-29 22:34:20,325 - INFO - SVI weights calculated successfully for analysis.
+2025-12-29 22:34:20,326 - INFO - Running GA for LongBeach...
+2025-12-29 22:34:20,329 - INFO - [Travel] Loading Base->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_base_to_task.csv
+2025-12-29 22:34:20,331 - INFO - [Travel] Loading Task->Task CSV: C:\2025-2026 Fall\Network science\Project\Evaluating post-earthquake impact and recovery of LA transmission grid on a census tract scale\Stage 4 Output\travel_task_to_task.csv
+2025-12-29 22:34:21,117 - INFO -   > Gen 50 Best Fitness: 1.89e+09
+2025-12-29 22:34:21,144 - INFO - SVI weights calculated successfully for analysis.
+2025-12-29 22:34:21,145 - INFO - ==================================================
+2025-12-29 22:34:21,146 - INFO - --- STAGE 6: Consolidation & Separate Plotting (Adaptive X; GA optional) ---
+2025-12-29 22:34:21,152 - INFO - SVI weights calculated successfully for analysis.
+2025-12-29 22:34:21,152 - INFO - Consolidating for Northridge...
+2025-12-29 22:34:21,728 - INFO - Saved plot: recovery_curve_Northridge_Population.png
+2025-12-29 22:34:22,268 - INFO - Saved plot: recovery_curve_Northridge_SVI_Weighted.png
+2025-12-29 22:34:22,268 - INFO - Consolidating for SanFernando...
+2025-12-29 22:34:22,857 - INFO - Saved plot: recovery_curve_SanFernando_Population.png
+2025-12-29 22:34:23,366 - INFO - Saved plot: recovery_curve_SanFernando_SVI_Weighted.png
+2025-12-29 22:34:23,366 - INFO - Consolidating for LongBeach...
+2025-12-29 22:34:23,898 - INFO - Saved plot: recovery_curve_LongBeach_Population.png
+2025-12-29 22:34:24,397 - INFO - Saved plot: recovery_curve_LongBeach_SVI_Weighted.png
+2025-12-29 22:34:24,436 - INFO - --- STAGE 6 Complete ---
+2025-12-29 22:34:24,436 - INFO - ==================================================
+2025-12-29 22:34:24,436 - INFO - --- STAGE 7: PCA + K-Means (Final Enhanced) ---
+2025-12-29 22:34:24,436 - INFO - 1. Preparing Features...
+2025-12-29 22:34:24,549 - INFO - Aggregating metrics across scenarios (taking mean)...
+2025-12-29 22:34:25,120 - INFO - Loading NRI tract table from C:\2025-2026 Fall\Network science\Project\NRI_Table_CensusTracts_California\NRI_Table_CensusTracts_California.csv
+2025-12-29 22:34:25,668 - INFO - Clustering on 18 features: ['T80', 'AUC', 'Init_Prob', 'Grid_Centrality', 'Grid_ImpactLambda2', 'Grid_Betweenness', 'N_subs', 'Redundancy_HHI', 'Dist_to_CrewYard_km', 'Pre_1970_Ratio', 'Pop_Density', 'NRI_RISK_SCORE', 'NRI_EAL_SCORE', 'NRI_BUILDVALUE', 'SVI_THEME1', 'SVI_THEME2', 'SVI_THEME3', 'SVI_THEME4']
+2025-12-29 22:34:25,674 - INFO -  > Kaiser Criterion: Selected 6 PCs (Eigenvalues > 1)
+2025-12-29 22:34:26,109 - INFO - Saved pca_scree_plot.png
+2025-12-29 22:34:27,251 - INFO -  > Auto-detected Best k (Clusters) = 3
+2025-12-29 22:34:28,168 - INFO - Saved pca_kmeans_scatter.png
+2025-12-29 22:34:28,168 - INFO - --- STAGE 7 Complete ---
+2025-12-29 22:34:28,168 - INFO - ======================================================================
+2025-12-29 22:34:28,176 - INFO - PIPELINE COMPLETED SUCCESSFULLY
+2025-12-29 22:34:28,177 - INFO - ======================================================================
