@@ -1,7 +1,7 @@
 # Robustness and Post-Earthquake Recovery of the Los Angeles Power Grid at Census-Tract Scale
 Team: Yinchen Yi, Yutong Li
 
-This repository presents a tract-resolved modeling pipeline to evaluate earthquake-driven disruption of the City of Los Angeles transmission grid and compare substation repair prioritization strategies under three objectives: restoring network structure, restoring electricity service to the population, and advancing equitable restoration across census tracts. Network-structure priorities are derived from substation centrality metrics, including degree, betweenness, closeness, and population-weighted impact centrality. K-means clustering is then used to group census tracts into resilience typologies based on simulated outage and recovery metrics and socioeconomic indicators.
+This repository presents a census tract-level modeling pipeline to evaluate earthquake-driven disruption of the City of Los Angeles transmission grid and compare substation repair prioritization strategies under three objectives: restoring network structure, restoring electricity service to the population, and advancing equitable restoration across census tracts. Network-structure priorities are derived from substation centrality metrics, including degree, betweenness, closeness, and population-weighted impact centrality. K-means clustering is then used to group census tracts into resilience typologies based on simulated outage and recovery metrics and socioeconomic indicators.
 
 ## Workflow
 1. Build a topological transmission network from substation locations (OpenStreetMap) and transmission-line geometries (California Energy Commission).
