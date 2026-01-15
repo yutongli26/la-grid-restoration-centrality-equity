@@ -18,14 +18,12 @@ This repository presents a census tract-level modeling pipeline to evaluate eart
 - U.S. Geological Survey ShakeMap (Peak Ground Acceleration). https://earthquake.usgs.gov/data/shakemap/
 - U.S. Census Bureau TIGER/Line (census tract boundaries). https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html
 - U.S. Census Bureau American Community Survey (ACS) 5-year estimates. https://api.census.gov/data.html
-- CDC/ATSDR Social Vulnerability Index (SVI). https://www.atsdr.cdc.gov/placeandhealth/svi/
+- CDC/ATSDR Social Vulnerability Index (SVI). https://www.atsdr.cdc.gov/place-health/php/svi/index.html
 
 ## Notes
 The pipeline is intended for scenario-based stress testing and comparative evaluation of restoration strategies. Connectivity-based robustness metrics quantify fragmentation but do not enforce power-flow feasibility unless operational constraints are added.
 
 Suggested run order: `Topology and Weight` → `C257H_Project_Main` → `Project Visualizer`.
-
-The function `run_replica_od_analysis(...)` in the main pipeline is not used in the current experiments. Stage 5 is reserved for a future optimization module.
 
 ## Citation
 
