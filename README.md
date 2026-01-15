@@ -8,7 +8,7 @@ This repository presents a census tract-level modeling pipeline to evaluate eart
 2. Use U.S. Geological Survey ShakeMap Peak Ground Acceleration (PGA) fields for three historical earthquakes (1933 Long Beach, 1971 San Fernando, 1994 Northridge) as test scenarios.
 3. Estimate probabilistic substation damage states and repair times using lognormal fragility functions with Monte Carlo sampling.
 4. Translate substation disruption into tract-level outage probabilities using a tract–substation weighting (mapping) matrix and generate spatial impact maps.
-5. Simulate restoration under an unconstrained baseline and a logistics-aware setting (28 crews dispatched from 7 bases with travel-time constraints).
+5. Simulate restoration under an unconstrained baseline and a logistics-aware setting (135 crews dispatched from 7 bases with travel-time constraints).
 6. Compare prioritization strategies (Random, Centrality-First, Population-Weighted Impact-First, Hospital-First) using service restoration and robustness metrics based on the largest connected component.
 7. Classify census tracts into resilience typologies using principal component analysis and k-means clustering with simulated recovery metrics and socioeconomic indicators.
 
