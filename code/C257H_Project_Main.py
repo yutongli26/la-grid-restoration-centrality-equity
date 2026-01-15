@@ -110,7 +110,7 @@ class Config:
 
     # --- Transmission line shapefile (CEC real network)
     TRANSMISSION_LINES_SHP: str = str(DATA_DIR / "TransmissionLine_CEC.shp")
-    MAX_LINE_ENDPOINT_DIST_KM: float = 10.0  # Endpoint matching radius
+    MAX_LINE_ENDPOINT_DIST_KM: float = 0.5  # Endpoint matching radius
 
     # --- Travel Time Inputs
     # Precomputed travel times conceptually live with Stage 4.
@@ -137,9 +137,12 @@ class Config:
     TIME_END_HR: float = 480
     SUPPLY_THRESH: float = 0.8
     DT_HR: float = 1.0
-    N_MC: int = 300
+    N_MC: int = 1000  # Number of MC samples per scenario
+    UNDAMAGED_EPS_HR: float = 0.5     # Treat repair time <= eps as undamaged
+    FUNCTIONAL_THRESHOLD: float = 0.5  # Substation functional if value >= threshold
+    GA_EXTRA_EVAL_HR: float = 24.0     # Extra horizon used in GA evaluation
     RNG_SEED: int = 42
-    N_CREWS: int = 28  # 7 bases * 3 crews
+    N_CREWS: int = 135  # 7 bases * 3 crews
     N_CORES: int = -1  # Use all available cores for Joblib
     K_NEIGHBORS: int = 5  # Fallback k for KNN graph
 
@@ -1501,6 +1504,7 @@ def compute_graph_robustness(
     G: nx.Graph,
     sub_series_df: pd.DataFrame,
     t_grid: np.ndarray,
+    cfg: Config,
 ) -> pd.DataFrame:
     """
     Compute dynamic graph robustness over time.
@@ -1560,7 +1564,7 @@ def compute_graph_robustness(
         last_functional_set = None
 
         for t in t_grid:
-            func_mask = sub_series_filtered.loc[t] > 0.5
+            func_mask = sub_series_filtered.loc[t] > cfg.FUNCTIONAL_THRESHOLD
             functional_nodes = set(func_mask.index[func_mask])
 
             # Reuse previous timestep's result when the functional set is unchanged
@@ -1676,8 +1680,7 @@ def run_stage_3(
         R_sub_mean_df = simulate_step_recovery(mean_series.values, t_grid, sub_index)
 
         # 3) Enforce correct state at t=0 for undamaged substations
-        undamaged_subs = mean_series[mean_series < 0.5].index
-
+        undamaged_subs = mean_series[mean_series <= cfg.UNDAMAGED_EPS_HR].index
         t0_idx = 0 if 0 in R_sub_mean_df.index else 0.0
         if t0_idx in R_sub_mean_df.index:
             R_sub_mean_df.loc[t0_idx, undamaged_subs] = 1.0
@@ -1708,7 +1711,7 @@ def run_stage_3(
 
         # 8) Compute dynamic graph robustness (if graph exists)
         if G.number_of_nodes() > 0:
-            robust_df = compute_graph_robustness(G, R_sub_mean_df, t_grid)
+            robust_df = compute_graph_robustness(G, R_sub_mean_df, t_grid, cfg)
             robust_path = out_dirs["STAGE3_DIR"] / f"graph_robustness_mean_{scenario}.csv"
             robust_df.to_csv(robust_path, index=False)
             logger.info(f"Saved dynamic graph robustness to {robust_path}")
@@ -1984,6 +1987,7 @@ def simulate_rule_schedule(
     t_grid: np.ndarray,
     sub_repair_durations: pd.Series,
     sub_index: pd.Index,
+    cfg: Config,
 ) -> pd.DataFrame:
     """
     Simulate a multi-crew repair schedule under a fixed task ordering.
@@ -2035,7 +2039,7 @@ def simulate_rule_schedule(
     # -------------------------------------------------------------------------
     sub_end_times = pd.Series(np.inf, index=sub_index)
 
-    undamaged_subs = sub_repair_durations[sub_repair_durations == 0].index
+    undamaged_subs = sub_repair_durations[sub_repair_durations <= cfg.UNDAMAGED_EPS_HR].index
     sub_end_times.loc[undamaged_subs] = 0.0
 
     # Task queue: only tasks that require repair
@@ -2281,6 +2285,7 @@ def run_stage_4(
                 t_grid,
                 sub_repair_durations,
                 sub_index,
+                cfg,
             )
 
             S_tract_df = propagate_to_tracts(R_sub_df, W_mat, tract_index)
@@ -2304,7 +2309,7 @@ def run_stage_4(
 
             # Dynamic graph robustness (unchanged)
             if G.number_of_nodes() > 0:
-                dyn_df = compute_graph_robustness(G, R_sub_df, t_grid)
+                dyn_df = compute_graph_robustness(G, R_sub_df, t_grid, cfg)
                 dyn_df.to_csv(out_dir / f"rule_graphrobustness_{scenario}_{rule}.csv", index=False)
             else:
                 pd.DataFrame({"t": [0], "lcc_fraction": [0.0]}).to_csv(
@@ -2410,6 +2415,10 @@ def run_stage_5(
     for scenario in cfg.SCENARIOS:
         logger.info(f"Running GA for {scenario}...")
 
+        run_seed = cfg.RNG_SEED + abs(hash(scenario))
+        random.seed(run_seed)
+        logger.info(f"  > GA Random Seed set to: {run_seed}")
+
         repair_times = all_mean_sub[scenario]
         tasks = repair_times[repair_times > 0.1]
         task_ids = list(tasks.index)
@@ -2465,7 +2474,7 @@ def run_stage_5(
                 locs[c] = int(t_idx)
                 end_times[int(t_idx)] = end
 
-            T_MAX = float(cfg.TIME_END_HR) + 24.0
+            T_MAX = float(cfg.TIME_END_HR) + float(cfg.GA_EXTRA_EVAL_HR)
             valid = end_times < T_MAX
 
             score = float(np.sum(task_vals[valid] * (T_MAX - end_times[valid])))
@@ -2523,7 +2532,7 @@ def run_stage_5(
         t_grid = np.arange(0, cfg.TIME_END_HR + cfg.DT_HR, cfg.DT_HR)
 
         # Use full repair_times series for safety (tasks is subset; either works if simulate_rule_schedule handles it)
-        R_sub = simulate_rule_schedule(best_order, cfg.N_CREWS, tmats, t_grid, repair_times, sub_index)
+        R_sub = simulate_rule_schedule(best_order, cfg.N_CREWS, tmats, t_grid, repair_times, sub_index, cfg)
         S_tract = propagate_to_tracts(R_sub, W_mat, tract_index)
 
         pop_w, _ = get_analysis_weights(cfg, stage_0_data)

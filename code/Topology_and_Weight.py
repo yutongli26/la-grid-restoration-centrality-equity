@@ -57,8 +57,9 @@ class Paths:
     # Core parameters
     # --------------------
     BBOX_PAD_KM: float = 50.0
-    LINE_SNAP_TOLERANCE_M: float = 300.0  # Strong snapping tolerance (meters)
-    MAX_LINE_ENDPOINT_DIST_KM: float = 5.0
+    LINE_SNAP_TOLERANCE_M: float = 100 # Strong snapping tolerance (meters)
+    MAX_LINE_ENDPOINT_DIST_KM: float = 0.5
+    LINE_SPLIT_TOLERANCE_M: float = 50.0  # Line split tolerance at substation points (meters)
 
 PATHS = Paths()
 
@@ -437,7 +438,7 @@ def build_topology_wrapper(
     lines_split = split_lines_at_points(
         lines_snapped,
         subs_proj,
-        tolerance=100.0,
+        tolerance=PATHS.LINE_SPLIT_TOLERANCE_M,
     )
 
     # C) Build MultiGraph with voltage attributes (if present)
@@ -751,9 +752,9 @@ def visualize_topology(
 # ---------------------------------------------------------------------------
 
 # Global IDW parameters
-IDW_POWER: float = 1.0          # w ~ 1 / d^p (default p=1)
+IDW_POWER: float = 2.0         # w ~ 1 / d^p (default p=1)
 MIN_DIST: float = 1e-3          # avoid division by zero when d == 0
-MIN_EFFECTIVE_WEIGHT: float = 0.02
+MIN_EFFECTIVE_WEIGHT: float = 0.01
 
 
 def build_W_matrix(

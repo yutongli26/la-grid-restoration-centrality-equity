@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import textwrap
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from pathlib import Path
 import math
@@ -34,6 +35,32 @@ CEC_TRANSMISSION_SHP: str = str(DATA_DIR / "TransmissionLine_CEC.shp")
 
 # City boundary
 CITY_BOUNDARY_SHP: str = str(DATA_DIR / "City_Boundary.shp")
+# ------------------------------------------------------------------------------
+# Pretty variable names for Stage 7 heatmaps/legends (from Visualizer_SL)
+# ------------------------------------------------------------------------------
+PRETTY_VAR_NAMES = {
+    "Init_Prob": "Initial outage probability",
+    "T50": "Recovery time (T50)",
+    "T80": "Recovery time (T80)",
+    "AUC": "AUC",
+    "Grid_Centrality": "Grid centrality",
+    "Grid_Betweenness": "Grid betweenness",
+    "Grid_ImpactLambda2": "Grid impact (λ2 loss)",
+    "N_subs": "Substations serving tract",
+    "Redundancy_HHI": "Redundancy (HHI)",
+    "Redundancy_MaxShare": "Redundancy (max share)",
+    "Dist_to_CrewYard_km": "Distance to crew yard (km)",
+    "Pop_Density": "Population density",
+    "Pre_1970_Ratio": "Pre-1970 housing ratio",
+    "SVI_THEME1": "SVI Theme 1: Socioeconomic",
+    "SVI_THEME2": "SVI Theme 2: Household composition/Disability",
+    "SVI_THEME3": "SVI Theme 3: Minority/Language",
+    "SVI_THEME4": "SVI Theme 4: Housing/Transport",
+    "NRI_RISK_SCORE": "NRI risk score",
+    "NRI_EAL_SCORE": "NRI expected annual loss",
+    "NRI_BUILDVALUE": "NRI building value",
+}
+
 
 # =============================================================================
 # Global plotting style (kept as module-level side effects)
@@ -398,9 +425,17 @@ def vis_stage2_topology_with_tracts_latlon():
     # -------------------------------------------------------------------------
     city = gpd.read_file(CITY_BOUNDARY_SHP)
     tracts = gpd.read_file(SHAPEFILE_PATH)
-
     if city.crs is None:
-        city = city.set_crs(epsg=3857)
+        minx, miny, maxx, maxy = city.total_bounds
+        if -180 <= minx <= 180 and -90 <= miny <= 90:
+            print(f"   [GIS Warning] CRS missing for City Boundary. Coordinates look like Lat/Lon. Assuming EPSG:4326.")
+            city = city.set_crs(epsg=4326)
+        else:
+            raise ValueError(
+                f"Shapefile '{CITY_BOUNDARY_SHP}' implies no CRS and coordinates are huge (e.g. {minx:.2f}). "
+                "Cannot safely assume projection. Please ensure .prj file exists."
+            )
+            
     city = city.to_crs(epsg=4326)
 
     if tracts.crs is None:
@@ -518,7 +553,16 @@ def vis_stage2_topology_with_tracts_latlon():
     # -------------------------------------------------------------------------
     cec_lines = gpd.read_file(CEC_TRANSMISSION_SHP)
     if cec_lines.crs is None:
-        cec_lines = cec_lines.set_crs(epsg=3857)
+        minx, miny, maxx, maxy = cec_lines.total_bounds
+        if -180 <= minx <= 180 and -90 <= miny <= 90:
+            print(f"   [GIS Warning] CRS missing for CEC Lines. Coordinates look like Lat/Lon. Assuming EPSG:4326.")
+            cec_lines = cec_lines.set_crs(epsg=4326)
+        else:
+            raise ValueError(
+                f"Shapefile '{CEC_TRANSMISSION_SHP}' implies no CRS and coordinates are NOT Lat/Lon (e.g. {minx:.2f}). "
+                "Cannot safely assume projection. Please fix source .prj."
+            )
+            
     cec_lines = cec_lines.to_crs(epsg=4326)
 
     xmin, ymin, xmax, ymax = city.total_bounds
@@ -708,6 +752,29 @@ def vis_stage2_top10_map():
             zorder=0,
         )
 
+
+    # City boundary outline (to make the city edge visible)
+    if "CITY_BOUNDARY_SHP" in globals() and os.path.exists(CITY_BOUNDARY_SHP):
+        try:
+            city_bnd = gpd.read_file(CITY_BOUNDARY_SHP)
+            if city_bnd.crs is None:
+                minx, miny, maxx, maxy = city_bnd.total_bounds
+                if -180 <= minx <= 180 and -90 <= miny <= 90:
+                    city_bnd = city_bnd.set_crs(epsg=4326)
+                else:
+                    print(f"   [GIS Error] City Boundary CRS missing & huge coords. Cannot assume 3857 safely.")
+                    raise ValueError("City Boundary shapefile missing CRS (.prj).")
+            city_bnd = city_bnd.to_crs(epsg=4326)
+            city_bnd.plot(
+                ax=ax,
+                facecolor="none",
+                edgecolor="#7a7a7a",
+                linewidth=1.2,
+                zorder=0.2,
+            )
+        except Exception as e:
+            print(f"  [Stage 2] City boundary plot skipped: {e}")
+
     # All substations
     all_subs_gdf.plot(
         ax=ax,
@@ -752,12 +819,20 @@ def vis_stage2_top10_map():
     bounds_found = False
 
     if "CITY_BOUNDARY_SHP" in globals() and os.path.exists(CITY_BOUNDARY_SHP):
-        city = gpd.read_file(CITY_BOUNDARY_SHP)
-        if city.crs is None:
-            city = city.set_crs(epsg=3857)
-        city = city.to_crs(epsg=4326)
-        minx, miny, maxx, maxy = city.total_bounds
-        bounds_found = True
+        try:
+            city = gpd.read_file(CITY_BOUNDARY_SHP)
+            if city.crs is None:
+                mx, my, Mxx, Mxy = city.total_bounds
+                if -180 <= mx <= 180 and -90 <= my <= 90:
+                    city = city.set_crs(epsg=4326)
+                else:
+                    print("   [GIS Warning] City Boundary CRS missing, skipping bounds check.")
+                    raise ValueError("Missing CRS")
+            city = city.to_crs(epsg=4326)
+            minx, miny, maxx, maxy = city.total_bounds
+            bounds_found = True
+        except Exception:
+            pass
     elif not all_subs_gdf.empty:
         minx, miny, maxx, maxy = all_subs_gdf.total_bounds
         bounds_found = True
@@ -1309,11 +1384,12 @@ def vis_stage4():
             df_base_task = pd.read_csv(base_to_task_file, index_col=0)
 
             # NOTE (logic risk): fillna(0) makes missing/unreachable look like 0 travel time.
-            df_plot = df_base_task.replace([np.inf, -np.inf], np.nan).fillna(0)
+            df_plot = df_base_task.replace([np.inf, -np.inf], np.nan)
 
             fig, ax = plt.subplots(figsize=(12, 10))
             sns.heatmap(
                 df_plot,
+                mask=df_plot.isna(),
                 cmap="YlGnBu",
                 cbar_kws={"label": "Travel Time (Hours)"},
                 xticklabels=False,
@@ -1344,11 +1420,12 @@ def vis_stage4():
             df_travel = pd.read_csv(task_matrix_file, index_col=0)
 
             # NOTE (logic risk): fillna(0) makes missing/unreachable look like 0 travel time.
-            df_plot = df_travel.replace([np.inf, -np.inf], np.nan).fillna(0)
+            df_plot = df_travel.replace([np.inf, -np.inf], np.nan)
 
             fig, ax = plt.subplots(figsize=(12, 10))
             sns.heatmap(
                 df_plot,
+                mask=df_plot.isna(),
                 cmap="YlGnBu",
                 cbar_kws={"label": "Travel Time (Hours)"},
                 xticklabels=False,
@@ -1706,11 +1783,14 @@ def vis_stage6():
     ax.legend(
         title="Metric Type",
         loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
         fontsize=13,
         title_fontsize=13,
         framealpha=0.95,
     )
 
+    # Leave room on the right for the legend so it won't cover bar labels
+    fig.subplots_adjust(right=0.78)
     fig.tight_layout()
     save_plot(fig, stage_dir, "vis_stage6_equity_gap.png")
 
@@ -1774,12 +1854,30 @@ def vis_stage7(gdf):
         df_scatter = df.copy()
         df_scatter["cluster"] = df_scatter["cluster"].astype(str)
 
+        # Stable cluster order + consistent colors across scatter + map
+        _clusters = df_scatter["cluster"].dropna().unique().tolist()
+        try:
+            _clusters_sorted = [str(c) for c in sorted([int(x) for x in _clusters])]
+        except Exception:
+            _clusters_sorted = sorted([str(x) for x in _clusters])
+
+        _cmap_name = "tab10" if len(_clusters_sorted) <= 10 else "tab20"
+        _cmap = plt.get_cmap(_cmap_name)
+        if hasattr(_cmap, "colors"):
+            _color_list = list(_cmap.colors)
+        else:
+            _color_list = [_cmap(i / max(1, (len(_clusters_sorted) - 1))) for i in range(len(_clusters_sorted))]
+        cluster_color_map = {
+            c: _color_list[i % len(_color_list)] for i, c in enumerate(_clusters_sorted)
+        }
+
         sns.scatterplot(
             data=df_scatter,
             x="PC1",
             y="PC2",
             hue="cluster",
-            palette="tab10",
+            palette=cluster_color_map,
+            hue_order=_clusters_sorted,
             s=50,
             ax=ax,
             linewidth=0.0,
@@ -1804,6 +1902,22 @@ def vis_stage7(gdf):
 
             df_map = df[["tract_id", "cluster"]].copy()
             df_map["cluster"] = df_map["cluster"].astype(str)
+
+            # Fallback: if scatter was skipped, still define consistent colors for map
+            if "cluster_color_map" not in locals():
+                _clusters = df_map["cluster"].dropna().unique().tolist()
+                try:
+                    _clusters_sorted = [str(c) for c in sorted([int(x) for x in _clusters])]
+                except Exception:
+                    _clusters_sorted = sorted([str(x) for x in _clusters])
+
+                _cmap_name = "tab10" if len(_clusters_sorted) <= 10 else "tab20"
+                _cmap = plt.get_cmap(_cmap_name)
+                if hasattr(_cmap, "colors"):
+                    _color_list = list(_cmap.colors)
+                else:
+                    _color_list = [_cmap(i / max(1, (len(_clusters_sorted) - 1))) for i in range(len(_clusters_sorted))]
+                cluster_color_map = {c: _color_list[i % len(_color_list)] for i, c in enumerate(_clusters_sorted)}
 
             merged = g_map.merge(df_map, on="tract_id", how="left")
 
@@ -1850,13 +1964,12 @@ def vis_stage7(gdf):
                 )
 
             observed.plot(
-                column="_cluster_code",
-                ax=ax,
-                cmap=cmap,
-                edgecolor="white",
-                linewidth=0.2,
-                zorder=1,
-            )
+                    ax=ax,
+                    color=observed["cluster"].map(cluster_color_map),
+                    edgecolor="white",
+                    linewidth=0.2,
+                    zorder=1,
+                )
 
             bounds_src = observed if not observed.empty else merged_plot
             minx, miny, maxx, maxy = bounds_src.total_bounds
@@ -1869,8 +1982,8 @@ def vis_stage7(gdf):
             # manual legend (discrete)
             import matplotlib.patches as mpatches
             handles = [
-                mpatches.Patch(color=cmap(i), label=str(clusters[i]))
-                for i in range(n_clusters)
+                mpatches.Patch(color=cluster_color_map[str(c)], label=str(c))
+                for c in _clusters_sorted
             ]
             if not missing.empty:
                 handles.append(mpatches.Patch(color="lightgrey", label="Missing"))
@@ -1970,6 +2083,17 @@ def vis_stage7(gdf):
             fmt=".1f",
             ax=ax,
         )
+
+        # Use prettier (longer) variable names and wrap so they are not truncated
+        _feat_labels = []
+        for _f in grp_z.T.index.tolist():
+            _label = PRETTY_VAR_NAMES.get(str(_f), str(_f))
+            _feat_labels.append(textwrap.fill(_label, width=34))
+        ax.set_yticklabels(_feat_labels, rotation=0)
+        ax.tick_params(axis="y", labelsize=10)
+        ax.tick_params(axis="x", labelsize=11)
+        fig.subplots_adjust(left=0.38)
+
         ax.set_title(
             "Cluster Feature Profiles (Z-score across clusters)",
             fontsize=16,
@@ -2035,7 +2159,7 @@ def vis_stage7(gdf):
             common_norm=False,
             fill=False,
             linewidth=2,
-            palette="tab10",
+            palette=cluster_color_map,
             ax=ax,
             warn_singular=False,
         )
