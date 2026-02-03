@@ -1,3 +1,6 @@
+data/MS_048_CA_pt01_MMI_GM_datafiles/*.csv filter=lfs diff=lfs merge=lfs -text
+data/NRI_Table_CensusTracts_California.csv filter=lfs diff=lfs merge=lfs -text
+data/la_drive.graphml filter=lfs diff=lfs merge=lfs -text
 data/MS_048_CA_pt01_MMI_GM_datafiles/CA_pt01_GM_maps.csv filter=lfs diff=lfs merge=lfs -text
 data/MS_048_CA_pt01_MMI_GM_datafiles/CA_pt01_GM_maps2.csv filter=lfs diff=lfs merge=lfs -text
 data/la_drive.graphml.xml filter=lfs diff=lfs merge=lfs -text
