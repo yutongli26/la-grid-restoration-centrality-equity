@@ -16,16 +16,17 @@ The pipeline supports both an **unconstrained baseline** and a **logistics-aware
 ---
 
 ## Key features
-
-- Scenario-based stress testing using historical ShakeMap PGA fields (e.g., 1933 Long Beach, 1971 San Fernando, 1994 Northridge)
+- Topological network construction from transmission line and substation data using endpoint snapping, line splitting at substations, and graph extraction of substation-to-substation direct links
+- Tract-substation weighting matrix (**W**) construction based on Inverse Distance Weighting
+- Centrality and percolation analysis of topological network
+- Scenario-based stress testing using ShakeMap PGA fields (1933 Long Beach, 1971 San Fernando, 1994 Northridge, 2%-in-50yr)
 - Probabilistic substation damage-state modeling using lognormal fragility with Monte Carlo sampling
-- Tract-level service/outage estimation through a tract–substation weighting matrix (**W**)
+- Tract-level service estimation through tract–substation weighting matrix (**W**)
 - Restoration simulation under:
-  - Baseline (no crew constraints)
-  - Logistics-aware scheduling (multi-crew, multi-depot, travel-time constraints)
-- Strategy comparison (e.g., Random / Centrality-first / Population-impact-first / Hospital-first) using service and network metrics
-- Tract resilience typology via PCA + K-means (simulated + socioeconomic features)
-
+  - Baseline (no constraints)
+  - Logistics-aware rule-based and GA optimisation-based scheduling (multi-crew, multi-depot, travel-time constraints)
+- Strategy comparison (Theoretical Limit / Random Baseline / Betweenness (Bridges) First / Impact (Population) First / Degree (Hubs) First / Hospital First / Impact λ2 (Grid) First / Closeness First / Balanced GA / HospFirst GA / Efficiency GA) using service and network metrics
+- Tract resilience typology via PCA + K-means using simulated + socioeconomic features
 ---
 
 ## Repository structure
