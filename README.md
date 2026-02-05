@@ -70,7 +70,7 @@ The pipeline supports both an **unconstrained baseline** and a **logistics-aware
 
 ## Inputs
 
-This repository expects external datasets, all of which included in the "data" folder. You may need to standardize IDs/CRS and file naming to match the pipeline configuration.
+This repository expects external datasets, all of which included in the "data" folder.
 
 - OpenStreetMap contributors (Open Database License): <https://www.openstreetmap.org/>
 - California Energy Commission GIS Data (transmission lines): <https://gis.data.ca.gov/>
@@ -97,13 +97,10 @@ Depending on enabled stages, the pipeline can export:
 
 - Connectivity-based robustness metrics are graph proxies and do not guarantee operational feasibility (e.g., AC/DC power flow, voltage constraints) unless such modules are added.
 - Service estimation depends on the tract–substation mapping matrix (W); results are sensitive to how W is constructed (distance decay, assignment rules, normalization, etc.).
-- Repair/recovery parameterization should be interpreted as scenario-based and comparative (not a calibrated operational forecast) unless validated against empirical restoration data.
 
 ---
 
 ## Citation
-
-If you use this codebase, please cite the following references as appropriate:
 
 - Cheng, B., Nozick, L., Dobson, I., Davidson, R., Obiang, D., Dias, J., & Granados, M. (2024). Quantifying the earthquake risk to the electric power transmission system in Los Angeles at the census tract level. *IEEE Access*. <https://doi.org/10.1109/ACCESS.2024.3408797>
 - Çağnan, Z., Davidson, R. A., & Guikema, S. D. (2006). Post-earthquake restoration planning for Los Angeles electric power. *Earthquake Spectra*, 22(3), 589–608. <https://doi.org/10.1193/1.2222400>
