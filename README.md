@@ -15,43 +15,27 @@ The pipeline supports both an **unconstrained baseline** and a **logistics-aware
 
 ---
 
-## Key features
-- Topological network construction from transmission line and substation data using endpoint snapping, line splitting at substations, and graph extraction of substation-to-substation direct links
-- Tract-substation weighting matrix (**W**) construction based on Inverse Distance Weighting
-- Centrality and percolation analysis of topological network
-- Scenario-based stress testing using ShakeMap PGA fields (1933 Long Beach, 1971 San Fernando, 1994 Northridge, 2%-in-50yr)
-- Probabilistic substation damage-state modeling using lognormal fragility with Monte Carlo sampling
-- Tract-level service estimation through tract–substation weighting matrix (**W**)
-- Restoration simulation under:
+## Workflow
+1. Topological network construction from transmission line and substation data using endpoint snapping, line splitting at substations, and graph extraction of substation-to-substation direct links
+2. Tract-substation weighting matrix (**W**) construction based on Inverse Distance Weighting
+3. Centrality and percolation analysis of topological network
+4. Scenario-based stress testing using ShakeMap PGA fields (1933 Long Beach, 1971 San Fernando, 1994 Northridge, 2%-in-50yr)
+5. Probabilistic substation damage-state modeling using lognormal fragility with Monte Carlo sampling
+6. Tract-level service estimation through tract–substation weighting matrix (**W**)
+7. Restoration simulation under:
   - Baseline (no constraints)
   - Logistics-aware rule-based and GA optimisation-based scheduling (multi-crew, multi-depot, travel-time constraints)
-- Strategy comparison (Theoretical Limit / Random Baseline / Betweenness (Bridges) First / Impact (Population) First / Degree (Hubs) First / Hospital First / Impact λ2 (Grid) First / Closeness First / Balanced GA / HospFirst GA / Efficiency GA) using service and network metrics
-- Tract resilience typology via PCA + K-means using simulated + socioeconomic features
+8. Strategy comparison (Theoretical Limit / Random Baseline / Betweenness (Bridges) First / Impact (Population) First / Degree (Hubs) First / Hospital First / Impact λ2 (Grid) First / Closeness First / Balanced GA / HospFirst GA / Efficiency GA) using service restoration metrics and connectivity-based robustness metrics
+9. Tract resilience typology via PCA + K-means using simulated + socioeconomic features
 ---
 
 ## Repository structure
 
-- `Topology_and_Weight.py` — Build transmission topology and tract–substation mapping matrix (W)
-- `IDW.py` — PGA interpolation (IDW) utilities
-- `build_travel_matrices_osm.py` — Travel-time matrices from road network (OSM-based)
-- `C257H_Project_Main.py` — Main pipeline (simulation + restoration + KPIs + typology)
-- `Project_Visualizer.py` — Mapping and figure generation
-
----
-
-## Workflow (high-level)
-
-1. Build a topological transmission network from substation locations (OpenStreetMap) and transmission-line geometries (California Energy Commission).
-2. Use USGS ShakeMap PGA fields for historical earthquakes as test scenarios (e.g., 1933 Long Beach, 1971 San Fernando, 1994 Northridge).
-3. Estimate probabilistic substation damage states and repair times using lognormal fragility functions with Monte Carlo sampling.
-4. Propagate substation disruption to tract-level service using a tract–substation mapping matrix (W), and generate spatial impact maps.
-5. Simulate restoration under:
-   - an unconstrained baseline; and
-   - a logistics-aware setting (e.g., 29 crews from 7 bases with travel-time constraints).
-6. Compare prioritization strategies (e.g., Random, Centrality-first, Population-impact-first, Hospital-first) using service restoration metrics and connectivity-based robustness metrics (e.g., LCC).
-7. Classify census tracts into resilience typologies using PCA + K-means with simulated recovery metrics and socioeconomic indicators.
-
----
+- `Topology_and_Weight.py` — Construct substation-level transmission topology (snapping/splitting + direct links) and export tract–substation influence weights (W / mapping CSVs)
+- `IDW.py` — Interpolate scenario PGA grids to substations (IDW/KDTree), producing per-scenario PGA_* columns for downstream simulations
+- `build_travel_matrices_osm.py` — Precompute base→substation and substation→substation travel-time matrices from OSM road network for crew scheduling
+- `C257H_Project_Main.py` — End-to-end pipeline (hazard→damage MC→network impact→restoration scheduling/GA→KPIs→typology clustering), outputs organized by Stage folders
+- `Project_Visualizer.py` — Post-processing visualizer: maps and comparative figures from Stage outputs (e.g., supply maps + histograms, logistics heatmaps, KPI bars, Gantt charts, cluster profile plots)
 
 ## Quickstart (suggested run order)
 
@@ -60,30 +44,33 @@ The pipeline supports both an **unconstrained baseline** and a **logistics-aware
     ```bash
     python Topology_and_Weight.py
     ```
+2. **Intensity measure interpolation**
 
-2. **Main pipeline (simulation + restoration + KPIs + typology)**
+    ```bash
+    python IDW.py
+    ```
+3. **Travel matrix**
+ 
+    ```bash
+    python build_travel_matrices_osm.py
+    ```
+4. **Main pipeline (simulation + restoration + KPIs + typology)**
 
     ```bash
     python C257H_Project_Main.py
     ```
 
-3. **Visualization**
+5. **Visualization**
 
     ```bash
     python Project_Visualizer.py
     ```
 
-If you want logistics-aware travel times from real road paths, run:
-
-```bash
-python build_travel_matrices_osm.py
-```
-
 ---
 
 ## Inputs
 
-This repository expects external datasets (not included). You may need to standardize IDs/CRS and file naming to match the pipeline configuration.
+This repository expects external datasets, all of which included in the "data" folder. You may need to standardize IDs/CRS and file naming to match the pipeline configuration.
 
 - OpenStreetMap contributors (Open Database License): <https://www.openstreetmap.org/>
 - California Energy Commission GIS Data (transmission lines): <https://gis.data.ca.gov/>
