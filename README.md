@@ -86,19 +86,20 @@ This repository expects external datasets, all of which included in the "data" f
 
 ---
 
-## Outputs (typical)
+## Outputs
 
 Depending on enabled stages, the pipeline can export:
 
 - Substation-level hazard/intensity sampling outputs (e.g., PGA assigned per substation per scenario)
 - Substation-level damage-state probabilities (MC) and recovery trajectories
-- Tract-level service/outage probabilities and recovery trajectories (via tract–substation mapping W)
-- Network robustness / topology metrics and comparative curves across strategies
-- Stage 4 logistics artifacts: travel-time matrices (base→task, task→task) and derived heatmaps
+- Tract-level service and recovery trajectories (via tract–substation mapping W)
+- Network robustness / topology metrics
+- Logistics: travel-time matrices (base→task, task→task) and derived heatmaps
 - Strategy-level KPI tables (system / population-weighted / equity-weighted), plus efficiency summaries (e.g., T50/T80/AUC)
-- Scheduling artifacts: rule-based schedules and Gantt chart inputs/plots (Stage 4), GA schedule CSVs and Gantt plots (Stage 5)
+- Comparative restoration curves across strategies
+- Scheduling: rule-based schedules and Gantt plots, GA schedules and Gantt plots
 - PCA & clustering outputs: PCA stats/loadings/scree plots, k-means diagnostics, final cluster labels, and tract typology summaries
-- Maps and publication-quality figures generated from Stage outputs (recovery curves, KPI comparisons, clusters)
+- Maps and figures generated from Stage outputs (recovery curves, KPI comparisons, clusters)
 
 ---
 
