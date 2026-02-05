@@ -6,7 +6,7 @@
 import os as _os
 import sys as _sys
 
-_os.environ.setdefault("OMP_NUM_THREADS", "13")
+_os.environ.setdefault("OMP_NUM_THREADS", "5")
 _os.environ.setdefault("LOKY_MAX_CPU_COUNT", "13")
 
 try:
@@ -56,6 +56,7 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.neighbors import kneighbors_graph
 from sklearn.preprocessing import StandardScaler
+from scipy.stats import norm
 
 # 
 from scipy.spatial import cKDTree
@@ -64,6 +65,9 @@ from shapely.geometry import Point, LineString, MultiPoint, MultiLineString, box
 from shapely.ops import split, snap
 import random
 from deap import base, creator, tools, algorithms
+
+# --- GLOBAL LOG STORE ---
+GLOBAL_GANTT_LOG = []
 
 # Configure Matplotlib for headless environments (kept in-place)
 matplotlib.use("Agg")
@@ -94,13 +98,16 @@ class Config:
     """Configuration dataclass for the entire pipeline."""
 
     # =========================================================================
-    DEVICES_CSV: str = str(DATA_DIR / "LA_Substations_WithFragility_UPDATED_CEC.csv")
+    DEVICES_CSV: str = str(DATA_DIR / "Los_Angeles_City_SUBSTATION_with_fragility_ORIGINAL.csv")
     PGA_CSV: str = str(DATA_DIR / "Substations_PGA_IDW_CEC.csv")
     MAP_TRACT_SUB_CSV: str = str(DATA_DIR / "tract_to_substation_mapping_CEC.csv")
     CEC_GRAPH_EDGES_CSV: str = str(DATA_DIR / "substation_graph_CEC_edges.csv")
     CEC_GRAPH_NODES_CSV: str = str(DATA_DIR / "substation_graph_CEC_nodes.csv")
     LA_TRACTS_PATH: str = str(DATA_DIR / "LA_Tracts_With_Population.shp")
     HOSPITAL_TRACTS_CSV: str = str(DATA_DIR / "hospital_with_tract.csv")
+    STAGE7_SVI_DATA_PATH: str = str(DATA_DIR / "California.csv")
+    STAGE7_NRI_DATA_PATH: str = str(DATA_DIR / "NRI_Table_CensusTracts_California.csv")
+    STAGE7_HOUSING_DATA_PATH: str = str(DATA_DIR / "ACSDT5Y2022.B25034-Data.csv")
 
     # --- Social Vulnerability Index (tract-level, optional)
     SVI_CSV: str = str(DATA_DIR / "LA_Census_Tracts_SOVI_Scores_with_Identifiers.csv")
@@ -116,7 +123,7 @@ class Config:
     # Precomputed travel times conceptually live with Stage 4.
     TRAVEL_BASE_TO_TASK_CSV: str = stage_file("4", "travel_base_to_task.csv")
     TRAVEL_TASK_TO_TASK_CSV: str = stage_file("4", "travel_task_to_task.csv")
-
+    VIRTUAL_VEL_KMH = 30.0  # Virtual travel speed for unconnected pairs
 
     # =========================================================================
     # OUTPUT DIRS (Relative to output root; follow the staged workflow naming)
@@ -133,17 +140,20 @@ class Config:
     # =========================================================================
     # RUNTIME PARAMETERS
     # =========================================================================
-    SCENARIOS: tuple = ("Northridge", "SanFernando", "LongBeach")
+    SCENARIOS: tuple = ("Northridge", "SanFernando", "LongBeach", "2pc50")
     TIME_END_HR: float = 480
     SUPPLY_THRESH: float = 0.8
-    DT_HR: float = 1.0
+    DT_HR: float = 0.05
     N_MC: int = 1000  # Number of MC samples per scenario
     UNDAMAGED_EPS_HR: float = 0.5     # Treat repair time <= eps as undamaged
     FUNCTIONAL_THRESHOLD: float = 0.5  # Substation functional if value >= threshold
     GA_EXTRA_EVAL_HR: float = 24.0     # Extra horizon used in GA evaluation
     RNG_SEED: int = 42
-    N_CREWS: int = 135  # 7 bases * 3 crews
-    N_CORES: int = -1  # Use all available cores for Joblib
+    N_CREWS_LOCAL: int = 15  
+    N_CREWS_MUTUAL_AID: int = 15 
+    N_CREWS = 30 
+    MUTUAL_AID_DELAY_HR: float = 8.0
+    N_CORES: int = -1
     K_NEIGHBORS: int = 5  # Fallback k for KNN graph
 
     # --- GA Parameters
@@ -152,9 +162,13 @@ class Config:
     GA_CXPB: float = 0.8
     GA_MUTPB: float = 0.2
     GA_N_RUNS: int = 3
-    W_POP: float = 1.0
-    W_HOSP: float = 20.0
-    W_MAKESPAN: float = 0.05
+    GA_SCENARIOS_CONFIG: Dict[str, Dict[str, float]] = field(
+        default_factory=lambda: {
+            "Balanced":   {"W_POP": 1.0, "W_HOSP": 3.0,  "W_MAKESPAN": 0.5},
+            "HospFirst":  {"W_POP": 1.0, "W_HOSP": 20.0, "W_MAKESPAN": 0.1},
+            "Efficiency": {"W_POP": 1.0, "W_HOSP": 1.0,  "W_MAKESPAN": 2.0},
+        }
+    )
 
     # --- Toggle Stages
     RUN_STAGE_1: bool = True
@@ -165,16 +179,19 @@ class Config:
     RUN_STAGE_6: bool = True
     RUN_STAGE_7: bool = True
 
-    # --- Crew Bases
+# --- Crew Bases (VALIDATED: Consolidated to Transmission Hubs)
+    # Rationale based on LADWP facility functions:
+    # 1. Valley Yard (Sun Valley): Functions as the Transmission Headquarters and heavy equipment depot.
+    #    Essential for Northridge & San Fernando scenarios.
+    # 2. Central Yard (Main St/Boylston): Functions as the Metro strategic hub.
+    #    Essential for Long Beach & downtown scenarios.
+    
     CREW_BASES: list = field(
         default_factory=lambda: [
-            ("West LA Yard", 34.0453, -118.4536),
-            ("Western Yard", 34.0455, -118.3615),
+            # --- Northern Hub: LADWP Transmission HQ (Truesdale/Sun Valley) ---
+            ("Valley Yard (Sun Valley)", 34.2318, -118.3817),
+            # --- Southern Hub: Central Repair Hub (Metro/Main St) ---
             ("Central Yard", 34.0375, -118.2555),
-            ("Wilmington Yard", 33.7731, -118.2633),
-            ("Van Nuys Yard", 34.1876, -118.4497),
-            ("Sun Valley Yard", 34.2318, -118.3817),
-            ("South LA Yard", 33.9813, -118.2920),
         ]
     )
 
@@ -261,17 +278,54 @@ def make_out_dirs(cfg: Config) -> Dict[str, Path]:
     return paths
 
 
-# --- Repair / functionality parameter tables ---------------------------------
-REPAIR_PARAM_LOGNORMAL = {
-    # ds: (mean_hr, log_std_dev).
-    1: (4.0, 0.5),   # Slight:   ~1 day
-    2: (12.0, 0.5),  # Moderate: ~3 days
-    3: (24.0, 0.5),  # Extensive: ~7 days
-    4: (72.0, 0.5),  # Complete: ~30 days
+# --- Repair / Functionality Parameter Tables ---------------------------------
+# Conventions:
+# - REPAIR_PARAM_NORMAL_HR: (mean_hours, std_hours)
+# - REPAIR_PARAM_LOGNORMAL: (median_hours, beta)  where beta is lognormal dispersion (ln-space)
+
+REPAIR_PARAM_NORMAL_HR = {
+    # DS1 (Slight)
+    # Typical actions: travel (2.0 h) + safety inspection (1.5 h) + relay reset (0.5 h)
+    # Reference: substation maintenance logs (relay reset typically < 4 h)
+    1: (4.0, 2.0),
+
+    # DS2 (Moderate)
+    # Typical actions: travel/inspection (3.5 h) + isolate one phase (2.5 h)
+    # Reference: standard utility operating protocol for N-1 operation
+    2: (6.0, 3.0),
+
+    # DS3 (Extensive)
+    # Typical actions: inspection (2.0 h) + manual isolation (2.0 h) + tie switching (4.0 h)
+    # Validation target: LADWP Northridge notes (~50% restored in ~7.5 h)
+    3: (8.0, 4.0),
+
+    # DS4 (Complete)
+    # Typical actions: clear site (2.0 h) + install temporary jumpers (8.0 h) + energize (2.0 h)
+    # Reference: MV/HV bypass cabling guidance (installation time per phase < 30 min, excluding setup)
+    4: (12.0, 6.0),
 }
 
-# Capacity multiplier by damage state (DS0 is undamaged).
-DS_CAPACITY = {0: 1.0, 1: 0.9, 2: 0.5, 3: 0.1, 4: 0.0}
+REPAIR_PARAM_LOGNORMAL = {
+    # DS1 (Slight)
+    # Dominant actions: automated/remote reset and minor checks
+    # Assumed median repair time: 0.25 h
+    1: (0.25, 1.082),
+
+    # DS2 (Moderate)
+    # Dominant actions: manual switching and small temporary reconfiguration
+    # Assumed median repair time: 2.0 h
+    2: (2.00, 1.082),
+
+    # DS3 (Extensive)
+    # Dominant actions: temporary bypass, transfer switching, and field work
+    # Assumed median repair time: 10.0 h
+    3: (10.0, 0.857),
+
+    # DS4 (Complete)
+    # Dominant actions: mobile equipment deployment and major reconfiguration
+    # Assumed median repair time: 24.0 h
+    4: (24.0, 0.857),
+}
 
 
 #  ==========================================================================
@@ -622,8 +676,8 @@ def sample_damage_states(
         logger.error(f"Missing fragility columns: {e}")
         raise
 
-    # 2) SciPy lognorm convention: scale = exp(mu)
-    scales = np.exp(mu_mat)
+    # 2) SciPy lognorm convention: scale = mu
+    scales = mu_mat
 
     # 3) Numerical cleanup to avoid invalid parameters
     scales = np.clip(scales, 1e-6, None)
@@ -659,69 +713,57 @@ def sample_damage_states(
 
     return ds_samples.astype(int)
 
-
+    
 def damage_to_functionality_and_repair(
     ds_samples: np.ndarray,
     rng: np.random.Generator,
+    cfg: Config,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Map sampled damage states to:
-        (1) initial functionality (capacity multiplier)
-        (2) stochastic repair time samples (hours), sampled from LogNormal parameters
-
-    Repair-time parameterization:
-        REPAIR_PARAM_LOGNORMAL[ds] = (mean_hr, sigma).
-        SciPy lognorm uses s=sigma and scale=exp(mu) (= median), where:
-            mean = exp(mu + 0.5*sigma^2)
-        Therefore:
-            mu = ln(mean_hr) - 0.5*sigma^2
-            scale = exp(mu)
+    Map sampled damage states to initial functionality and repair times.
     """
-    logger = logging.getLogger()
+    # 1) Init functionality @ t=0
+    DS_INIT_FUNC_MAP = {0: 1.0}
 
-    # 1) Map to initial functionality
-    v_func = np.vectorize(DS_CAPACITY.get)
-    func0_samples = v_func(ds_samples)
+    for ds, (mean_hr, std_hr) in REPAIR_PARAM_NORMAL_HR.items():
+        if std_hr > 1e-9:
+            DS_INIT_FUNC_MAP[ds] = norm.cdf(0.0, loc=mean_hr, scale=std_hr)
+        else:
+            DS_INIT_FUNC_MAP[ds] = 1.0 if mean_hr <= 0 else 0.0
 
-    # 2) Map to repair times
+    func0_samples = np.full(ds_samples.shape, np.nan, dtype=float)
+    for ds, val in DS_INIT_FUNC_MAP.items():
+        func0_samples[ds_samples == ds] = float(val)
+
+    # 2) Repair time samples (hr)
     repair_time_samples = np.zeros_like(ds_samples, dtype=float)
+    min_repair_time = 0
 
     for ds in range(1, 5):
-        mask = ds_samples == ds
+        mask = (ds_samples == ds)
+        n = int(mask.sum())
+        if n <= 0:
+            continue
+
         try:
-            n_samples_ds = int(mask.sum())
-            if n_samples_ds <= 0:
-                continue
+            mean_hr, std_hr = REPAIR_PARAM_NORMAL_HR.get(ds, (np.nan, np.nan))
+            mean_hr = float(mean_hr)
+            std_hr  = float(std_hr)
 
-            params = REPAIR_PARAM_LOGNORMAL.get(ds, (12.0, 0.5))
-            mean_hr, sigma = params
+            if std_hr <= 1e-9:
+                samples = np.full(n, mean_hr, dtype=float)
+            else:
+                samples = rng.normal(loc=mean_hr, scale=std_hr, size=n)
 
-            # Guard against non-positive or degenerate parameters
-            mean_hr = max(float(mean_hr), 1e-6)
-            sigma = max(float(sigma), 1e-6)
+            repair_time_samples[mask] = np.maximum(samples, min_repair_time)
 
-            # Convert mean -> mu so that E[T] = mean_hr
-            mu = np.log(mean_hr) - 0.5 * (sigma ** 2)
+        except Exception:
+            raise ValueError(f"Invalid repair parameters for DS {ds}: mean={mean_hr}, std={std_hr}")
 
-            # SciPy lognorm: scale = exp(mu) = median
-            scale = np.exp(mu)
-
-            repair_time_samples[mask] = lognorm(s=sigma, scale=scale).rvs(
-                size=n_samples_ds,
-                random_state=rng,
-            )
-
-        except Exception as e:
-            logger.error(f"Error sampling repair time for DS={ds}: {e}")
-            # Fallback: use the mean directly (consistent with parameter-table semantics)
-            repair_time_samples[mask] = float(REPAIR_PARAM_LOGNORMAL.get(ds, (12.0, 0.5))[0])
-
-    return func0_samples, repair_time_samples                                                                                                                                                                                                                                                                                                                                                                    
+    return func0_samples, repair_time_samples
 
 
-# ==============================================================================
 # Substation ID normalization utilities
-# ==============================================================================
 SUBSTATION_ID_CANON_COL = "substation_id"
 SUBSTATION_ID_SOURCE_COLS = ["substation_id", "HIFLD_ID", "id"]
 
@@ -764,41 +806,41 @@ def _process_mc_chunk(
     tract_index,
     n_chunk,
     rng_seed,
+    cfg,
 ):
-    """Helper function for parallel MC processing."""
+    """Helper function for parallel MC processing with voltage-dependent redundancy."""
     rng = np.random.default_rng(rng_seed)
     n_devices = len(devices_df)
-    n_tracts = len(tract_index)
 
-    # --- Generate samples for this chunk --------------------------------------
+    # --- Generate samples for this chunk ------------------------------------
     ds_samples = sample_damage_states(pga_series, devices_df, n_chunk, rng)
-    func0_samples, repair_time_samples = damage_to_functionality_and_repair(ds_samples, rng)
 
-    # --- Device-level aggregation ---------------------------------------------
-    # Return mean DS (not all samples) to reduce memory usage
+    # DS -> (func0, repair_time)
+    func0_samples, repair_time_samples = damage_to_functionality_and_repair(
+        ds_samples,
+        rng,
+        cfg,
+    )
+
+    # --- Device-level aggregation -------------------------------------------
+    # Mean DS per device over this chunk (memory-saving)
     ds_avg_chunk = ds_samples.mean(axis=1)
 
-    # --- Tract-level aggregation ----------------------------------------------
-    # Project initial functionality to tracts:
+    # Mean t=0 functionality per device over this chunk (new)
+    func0_avg_chunk = func0_samples.mean(axis=1)
+
+    # --- Tract-level aggregation --------------------------------------------
     # (n_tracts, n_devices) @ (n_devices, n_chunk) -> (n_tracts, n_chunk)
     S_t_samples = W_mat @ func0_samples
+    tract_supply_chunk = S_t_samples.mean(axis=1)
 
-    # Tract outage probability (supply < 40% per the legacy script)
-    tract_outage_chunk = (S_t_samples < 0.4).mean(axis=1)
-
-    # Tract average DS (legacy script convention)
-    tract_ds_samples = np.digitize(1 - S_t_samples, bins=[0.1, 0.3, 0.6, 1.0])
-    tract_avg_ds_chunk = tract_ds_samples.mean(axis=1)
-
-    # --- Records ---------------------------------------------------------------
-    # Build long-form device-level MC records
+    # --- Records ------------------------------------------------------------
     mc_ids = (
         np.arange(n_chunk, dtype=np.uint32)
         .reshape(1, -1)
         .repeat(n_devices, axis=0)
     )
 
-    # Use standardized substation_id
     sub_ids = get_substation_id_array(devices_df)
     sub_ids_rep = np.repeat(sub_ids.reshape(-1, 1), n_chunk, axis=1)
 
@@ -808,6 +850,7 @@ def _process_mc_chunk(
             "mc_id": mc_ids.ravel(),
             "substation_id": sub_ids_rep.ravel(),
             "damage_state": ds_samples.ravel(),
+            "init_func0": func0_samples.ravel(), 
             "repair_time_hr": repair_time_samples.ravel(),
         }
     )
@@ -815,14 +858,14 @@ def _process_mc_chunk(
     return (
         device_records_df,
         ds_avg_chunk,
-        tract_outage_chunk,
-        tract_avg_ds_chunk,
+        func0_avg_chunk,  
+        tract_supply_chunk,
         repair_time_samples,
     )
 
 
 def run_stage_1(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
-    """Orchestrate Stage 2 Monte Carlo fragility sampling (Joblib parallel)."""
+    """Orchestrate Stage 1 Monte Carlo fragility sampling (Joblib parallel)."""
     if not cfg.RUN_STAGE_1:
         logging.info("--- STAGE 1: Skipped ---")
         return {}
@@ -858,13 +901,24 @@ def run_stage_1(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
     base_rng = np.random.default_rng(cfg.RNG_SEED)
     chunk_seeds = base_rng.integers(low=1, high=2**31, size=n_workers)
 
-    all_mc_repair_times = {}  # For Stage 3
-
+    all_mc_repair_times = {}
+    all_mean_func0 = {} 
     for scenario in cfg.SCENARIOS:
         logger.info(f"Processing scenario: {scenario}...")
 
         pga_col = f"pga_{scenario}"
-        pga_series = devices_merged[pga_col]
+
+        scen_key = str(scenario).lower()
+        use_new_fragility = ("2pc" in scen_key)
+        devices_scen = devices_merged.copy()
+        if use_new_fragility:
+            pass
+        else:
+            for ds in range(1, 5):
+                devices_scen[f"mu_DS{ds}"] = devices_scen[f"mu_DS{ds}_old"]
+                devices_scen[f"beta_DS{ds}"] = devices_scen[f"beta_DS{ds}_old"]
+
+        pga_series = devices_scen[pga_col]
 
         pga_stats = pga_series.describe()
         logger.info(
@@ -879,23 +933,22 @@ def run_stage_1(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
             delayed(_process_mc_chunk)(
                 scenario,
                 pga_series,
-                devices_merged,
+                devices_scen,
                 W_mat,
                 tract_index,
                 n_chunk,
                 seed,
+                cfg,
             )
             for n_chunk, seed in zip(chunks, chunk_seeds)
         )
 
         # --- Unpack and aggregate chunk results --------------------------------
         device_records_list = [r[0] for r in results]
-
-        ds_avg_chunks = np.stack([r[1] for r in results], axis=1)
-        tract_outage_chunks = np.stack([r[2] for r in results], axis=1)
-        tract_avg_ds_chunks = np.stack([r[3] for r in results], axis=1)
-
-        repair_time_chunks = [r[4] for r in results]  # list of (n_devices, n_chunk)
+        ds_avg_chunks       = np.stack([r[1] for r in results], axis=1)
+        func0_avg_chunks    = np.stack([r[2] for r in results], axis=1)
+        tract_supply_chunks = np.stack([r[3] for r in results], axis=1)
+        repair_time_chunks  = [r[4] for r in results]
 
         # --- 1) MC_Device_Damage_Records_<scenario>.csv.gz ----------------------
         device_records_df = pd.concat(device_records_list, ignore_index=True)
@@ -915,7 +968,7 @@ def run_stage_1(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
         # Free memory
         del device_records_df, device_records_list
 
-        # --- 2) MC_Device_Damage_AvgDS_<scenario>.csv ---------------------------
+        # --- 2a) MC_Device_Damage_AvgDS_<scenario>.csv ---------------------------
         # Aggregate: (n_devices, n_chunks) -> (n_devices,)
         weights = np.array(chunks) / cfg.N_MC
         device_avg_ds = np.average(ds_avg_chunks, axis=1, weights=weights)
@@ -931,38 +984,42 @@ def run_stage_1(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
         out_path = out_dirs["STAGE1_DIR"] / f"MC_Device_Damage_AvgDS_{scenario}.csv"
         df_dev_avg.to_csv(out_path, index=False)
 
-        # --- 3) MC_TractAvgDS_<scenario>.csv -----------------------------------
-        tract_avg_ds = np.average(tract_avg_ds_chunks, axis=1, weights=weights)
-        df_tract_avg = pd.DataFrame(
+        # --- 2b) MC_Device_InitFuncMean_<scenario>.csv --------------------------
+        device_mean_func0 = np.average(func0_avg_chunks, axis=1, weights=weights)
+
+        df_init = pd.DataFrame(
             {
-                "tract_id": tract_index,
+                "substation_id": sub_index,
                 "scenario": scenario,
-                "tract_avg_damage_state": tract_avg_ds,
+                "mean_func0": device_mean_func0,
             }
         )
 
-        out_path = out_dirs["STAGE1_DIR"] / f"MC_TractAvgDS_{scenario}.csv"
-        df_tract_avg.to_csv(out_path, index=False)
+        out_path = out_dirs["STAGE1_DIR"] / f"MC_Device_InitFuncMean_{scenario}.csv"
+        df_init.to_csv(out_path, index=False)
+        logger.info(f"Saved init func mean: {out_path}")
 
-        # --- 4) MC_TractOutage_Prob_<scenario>.csv ------------------------------
-        tract_outage_prob = np.average(tract_outage_chunks, axis=1, weights=weights)
-        df_tract_outage = pd.DataFrame(
+        all_mean_func0[scenario] = device_mean_func0
+
+        # --- 3) MC_Tract_Supply_<scenario>.csv ------------------------------
+        tract_supply = np.average(tract_supply_chunks, axis=1, weights=weights)
+        df_tract_supply = pd.DataFrame(
             {
                 "tract_id": tract_index,
                 "scenario": scenario,
-                "peak_outage_prob": tract_outage_prob,
+                "supply": tract_supply,
             }
         )
 
-        out_path = out_dirs["STAGE1_DIR"] / f"MC_TractOutage_Prob_{scenario}.csv"
-        df_tract_outage.to_csv(out_path, index=False)
+        out_path = out_dirs["STAGE1_DIR"] / f"MC_Tract_Supply_{scenario}.csv"
+        df_tract_supply.to_csv(out_path, index=False)
 
-        # --- 5) Store full repair time samples for Stage 3 ----------------------
+        # --- 4) Store full repair time samples ----------------------
         all_mc_repair_times[scenario] = np.concatenate(repair_time_chunks, axis=1)
         logger.info(f"Aggregated results for {scenario}.")
 
     logger.info("--- STAGE 1 Complete ---")
-    return {"all_mc_repair_times": all_mc_repair_times}
+    return {"all_mc_repair_times": all_mc_repair_times, "all_mean_func0": all_mean_func0}
 
 
 # ==========================================================================
@@ -1409,25 +1466,86 @@ def run_stage_2(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
 # [PART 5] Stage 3: Dynamic Recovery Simulation (Theoretical Limit)
 # =============================================================================
 # Contains: Step recovery simulation, KPIs (T50/T80), Graph Robustness, run_stage_3
-def simulate_step_recovery(
-    sub_repair_times: np.ndarray,
+def simulate_recovery(
     t_grid: np.ndarray,
     sub_index: pd.Index,
+    damage_probs: pd.DataFrame,
+    start_times: np.ndarray = None,
+    method: str = 'normal',
 ) -> pd.DataFrame:
     """
-    Build substation step-recovery time series:
-        R_sub[i](t) = 1{ t >= repair_time_i }
-
-    Returns:
-        DataFrame of shape (n_timesteps, n_substations)
-        with index = t_grid and columns = sub_index.
+    Build substation recovery time series using Probabilistic Restoration Models.
+    
+    Method 'normal':
+        Formula: Func(t) = Sum( P(DS_k) * NormCDF_k(t - start_time; mu/factor, sigma) )
+    
+    Method 'lognormal':
+        Formula: Func(t) = Sum( P(DS_k) * LognormCDF_k(t - start_time; s=beta, scale=median) )
     """
-    # (n_timesteps, 1) >= (1, n_substations) -> (n_timesteps, n_substations)
-    t_grid_col = t_grid.reshape(-1, 1)
-    repair_times_row = sub_repair_times.reshape(1, -1)
+    n_time = len(t_grid)
+    n_subs = len(sub_index)
 
-    R_sub_mat = (t_grid_col >= repair_times_row).astype(float)
-    return pd.DataFrame(R_sub_mat, index=t_grid, columns=sub_index)
+    # 1. Handle Start Times (Shift)
+    # If no start time provided (Stage 3), everyone starts at t=0
+    if start_times is None:
+        start_times = np.zeros(n_subs)
+    
+    # 2. Reshape for Broadcasting: (Time, 1) - (1, Subs) = (Time, Subs)
+    # This creates the "Effective Repair Time" matrix
+    t_eff_matrix = t_grid[:, np.newaxis] - start_times[np.newaxis, :]
+    
+    # Safety clip for Lognormal (undefined for t <= 0)
+    t_eff_matrix = np.maximum(t_eff_matrix, 1e-9)
+
+    # 3. Align Probabilities to Substation Order
+    probs_arr = damage_probs.reindex(sub_index, fill_value=0.0).values
+    F_t_mat = np.zeros((n_time, n_subs))
+    
+    # 4. Select Restoration Parameters based on Method
+    if method == 'lognormal':
+        ds_params = REPAIR_PARAM_LOGNORMAL
+    else:
+        ds_params = REPAIR_PARAM_NORMAL_HR
+
+    # 5. Vectorized Curve Accumulation
+    for ds in range(5):
+        weight_ds = probs_arr[:, ds]
+        
+        # Optimization: Skip if no substation has this DS
+        if np.sum(weight_ds) == 0:
+            continue
+
+        if ds == 0:
+            # DS0: Functionality is 1.0 from t=0
+            F_t_mat += weight_ds[np.newaxis, :]
+        else:
+            # Retrieve parameters for current DS
+            params = ds_params.get(ds, None)
+            if params is None: continue
+            
+            p1, p2 = params  # (Mu, Sigma) or (Median, Beta)
+
+            # Core Logic Switch
+            if method == 'lognormal':
+                # Expert Logic: Lognorm(Median, Beta)
+                # s=Beta, scale=Median
+                cdf_vals = lognorm.cdf(t_eff_matrix, s=p2, scale=p1)
+                
+            elif method == 'normal':
+                # Old Logic: Normal(Mean/Factor, Std)
+                # Apply bypass factor to Mean only
+                adjusted_mu = p1
+                cdf_vals = norm.cdf(t_eff_matrix, loc=adjusted_mu, scale=p2)
+            
+            else:
+                raise ValueError(f"Unknown method: {method}")
+            
+            # Add Weighted Contribution: P(DS) * CDF(t)
+            # Broadcasting: (1, N_subs) * (N_time, N_subs)
+            F_t_mat += weight_ds[np.newaxis, :] * cdf_vals
+
+    # Clip result to [0, 1] to handle floating point noise
+    return pd.DataFrame(np.clip(F_t_mat, 0.0, 1.0), index=t_grid, columns=sub_index)
 
 
 def propagate_to_tracts(
@@ -1564,7 +1682,7 @@ def compute_graph_robustness(
         last_functional_set = None
 
         for t in t_grid:
-            func_mask = sub_series_filtered.loc[t] > cfg.FUNCTIONAL_THRESHOLD
+            func_mask = sub_series_filtered.loc[t] >= cfg.FUNCTIONAL_THRESHOLD
             functional_nodes = set(func_mask.index[func_mask])
 
             # Reuse previous timestep's result when the functional set is unchanged
@@ -1627,98 +1745,123 @@ def compute_graph_robustness(
 
 
 def run_stage_3(
-    cfg,
-    stage_1_data,
-    stage_0_data,
-    stage_2_data,
-    out_dirs,
-) -> dict:
-    """Orchestrate Stage 3: step recovery simulation using mean repair times."""
+    cfg: Config,
+    stage_1_data: Dict,
+    stage_0_data: Dict,
+    stage_2_data: Dict,
+    out_dirs: Dict,
+) -> Dict:
+    """
+    Orchestrate Stage 3: HAZUS PROBABILISTIC RESTORATION (Aggregation).
+    
+    Replaces deterministic step functions with the 'Expected Functionality' curve.
+    
+    Logic:
+    1. Reads raw Stage 1 MC samples (Damage States 0-4).
+    2. Calculates P(DS) for every substation.
+    3. Generates the weighted average of Hazus S-Curves (0->1).
+    """
     if not cfg.RUN_STAGE_3:
         logging.info("--- STAGE 3: Skipped ---")
         return {}
 
     logger = logging.getLogger()
     logger.info("=" * 50)
-    logger.info("--- STAGE 3: Step Recovery Simulation ---")
+    logger.info("--- STAGE 3: Hazus Probabilistic Recovery (MC Aggregation) ---")
 
-    all_mc_repair_times = stage_1_data.get("all_mc_repair_times")
-    if not all_mc_repair_times:
-        logger.error("FATAL: Missing 'all_mc_repair_times' from Stage 2. Cannot run Stage 3.")
-        return {}
+    # --- 1. Validation & Setup ---
+    # We still check for Stage 1 inputs, though we primarily read from disk now.
+    if "all_mc_repair_times" not in stage_1_data:
+         logger.warning("Stage 1 'all_mc_repair_times' not found in memory. Ensure Stage 1 ran.")
 
     W_mat = stage_0_data["W_mat"]
     tract_index = stage_0_data["tract_index"]
     sub_index = stage_0_data["sub_index"]
     G = stage_2_data.get("G", nx.Graph())
 
+    # --- 2. Simulation Loop ---
     t_grid = np.arange(0, cfg.TIME_END_HR + cfg.DT_HR, cfg.DT_HR)
-
-    all_mean_sub_repair_times = {}
+    
+    # Output Containers
+    all_damage_probs = {}          # <--- Critical for Stage 4/5 (The "Model")
+    all_mean_sub_repair_times = {} # Logistics: Duration for Crew Scheduling
+    all_mean_sub_init_func0 = {}   # Consistency: t=0 state
     all_mean_tract_series = {}
 
     for scenario in cfg.SCENARIOS:
         logger.info(f"Processing scenario: {scenario}...")
 
-        repair_times_samples = all_mc_repair_times[scenario]
+        # A. Load Stage 1 Monte Carlo Records (The Raw Damage States)
+        recs_path = out_dirs["STAGE1_DIR"] / f"MC_Device_Damage_Records_{scenario}.csv.gz"
+        if not recs_path.exists():
+            logger.error(f"Missing Stage 1 records file: {recs_path}")
+            continue
+        df_recs = pd.read_csv(recs_path)
+        df_recs["substation_id"] = df_recs["substation_id"].astype(str).str.strip()
 
-        # 1) Mean repair time across Monte Carlo samples (per substation)
-        mean_vals = repair_times_samples.mean(axis=1)
+        # B. Calculate Damage Probabilities (Aggregation)
+        # Count frequency of DS0, DS1, DS2... for each substation
+        ds_counts = pd.crosstab(df_recs["substation_id"], df_recs["damage_state"])
+        ds_probs = ds_counts.div(ds_counts.sum(axis=1), axis=0)
+        
+        # Ensure matrix has all substations and all 5 DS columns (0-4)
+        ds_probs = ds_probs.reindex(index=sub_index.astype(str), columns=range(5), fill_value=0.0)
+        
+        # Store for later stages
+        all_damage_probs[scenario] = ds_probs
 
-        # If a substation is undamaged in all MC runs, force mean to 0
-        mean_vals[repair_times_samples.max(axis=1) == 0] = 0
-
-        mean_series = pd.Series(
-            mean_vals,
-            index=sub_index,
-            name="mean_repair_time_hr",
+        # C. Simulate Recovery Curve (Theoretical Best Case)
+        # Uses the new engine. start_times=None means everyone starts at t=0.
+        logger.info(f"Generating expected Hazus S-Curves for {scenario}...")
+        R_sub_mean_df = simulate_recovery(
+            t_grid, 
+            sub_index, 
+            ds_probs, 
+            start_times=None
         )
-        all_mean_sub_repair_times[scenario] = mean_series
 
-        # 2) Simulate the mean step-recovery curve
-        logger.info(f"Simulating mean recovery curve for {scenario}...")
-        R_sub_mean_df = simulate_step_recovery(mean_series.values, t_grid, sub_index)
+        # D. Logistics: Calculate Mean Duration for Scheduling
+        # Stage 4 needs a discrete "Job Duration" to book crews, even if the 
+        # recovery itself is a probability curve. We use the MC mean for this.
+        raw_times = stage_1_data["all_mc_repair_times"][scenario]
+        mean_vals = raw_times.mean(axis=1)
+        mean_vals[raw_times.max(axis=1) == 0] = 0.0 # Handle undamaged
+        
+        all_mean_sub_repair_times[scenario] = pd.Series(
+            mean_vals, index=sub_index, name="mean_repair_time_hr"
+        )
+        
+        # Capture t=0 state from the generated curve
+        all_mean_sub_init_func0[scenario] = R_sub_mean_df.iloc[0]
 
-        # 3) Enforce correct state at t=0 for undamaged substations
-        undamaged_subs = mean_series[mean_series <= cfg.UNDAMAGED_EPS_HR].index
-        t0_idx = 0 if 0 in R_sub_mean_df.index else 0.0
-        if t0_idx in R_sub_mean_df.index:
-            R_sub_mean_df.loc[t0_idx, undamaged_subs] = 1.0
-            logger.info(f"Fixed t=0 state for {len(undamaged_subs)} undamaged substations.")
-
-        # 4) Propagate substation recovery to census tracts
+        # E. Propagate to Census Tracts
         S_tract_mean_df = propagate_to_tracts(R_sub_mean_df, W_mat, tract_index)
         all_mean_tract_series[scenario] = S_tract_mean_df
 
-        # 5) Save tract-level time series
+        # F. Save Results & Compute KPIs
         out_path = out_dirs["STAGE3_DIR"] / f"tract_step_recovery_mean_{scenario}.csv.gz"
         S_tract_mean_df.to_csv(out_path, compression="gzip", float_format="%.4f")
 
-        # 6) Compute and save KPIs (T50, T80, AUC)
         kpis = kpis_from_series(S_tract_mean_df, cfg.TIME_END_HR)
-        kpi_path = out_dirs["STAGE3_DIR"] / f"tract_kpis_{scenario}.csv"
-        kpis.to_csv(kpi_path)
-
-        # 7) Log system-wide summary
+        kpis.to_csv(out_dirs["STAGE3_DIR"] / f"tract_kpis_{scenario}.csv")
+        
+        # Log System T50
         system_curve = S_tract_mean_df.mean(axis=1)
-        system_kpis = kpis_from_series(system_curve.to_frame("system"), cfg.TIME_END_HR)
+        sys_t50 = system_curve.index[np.argmax(system_curve.values >= 0.5)] if system_curve.max() >= 0.5 else -1
+        logger.info(f"Scenario {scenario} System T50: {sys_t50} hr")
 
-        logger.info(
-            f"OK {scenario}: {len(tract_index)} tracts saved. "
-            f"System T50: {system_kpis['T50'].values[0]:.1f} hr, "
-            f"System T80: {system_kpis['T80'].values[0]:.1f} hr."
-        )
-
-        # 8) Compute dynamic graph robustness (if graph exists)
+        # G. Graph Robustness
         if G.number_of_nodes() > 0:
             robust_df = compute_graph_robustness(G, R_sub_mean_df, t_grid, cfg)
-            robust_path = out_dirs["STAGE3_DIR"] / f"graph_robustness_mean_{scenario}.csv"
-            robust_df.to_csv(robust_path, index=False)
-            logger.info(f"Saved dynamic graph robustness to {robust_path}")
+            robust_df.to_csv(out_dirs["STAGE3_DIR"] / f"graph_robustness_mean_{scenario}.csv", index=False)
 
     logger.info("--- STAGE 3 Complete ---")
+    
+    # RETURN the probability table so Stage 4/5 can use it!
     return {
+        "all_damage_probs": all_damage_probs,           # <--- NEW
         "all_mean_sub_repair_times": all_mean_sub_repair_times,
+        "all_mean_sub_init_func0": all_mean_sub_init_func0,
         "all_mean_tract_series": all_mean_tract_series,
     }
 
@@ -1766,7 +1909,11 @@ def load_travel_matrices(
     # Extract coordinates for relevant task substations
     # NOTE: This function assumes devices_df has columns: ["id", "lat", "lon"].
     task_devices = devices_df.set_index("id").reindex(task_sub_ids)
-
+    if "lon" not in task_devices.columns and "LONGITUDE" in task_devices.columns:
+        task_devices = task_devices.rename(columns={"LONGITUDE": "lon"})
+    if "lat" not in task_devices.columns and "LATITUDE" in task_devices.columns:
+        task_devices = task_devices.rename(columns={"LATITUDE": "lat"})
+        
     # =========================================================================
     # 1) Base -> Task matrix
     # =========================================================================
@@ -1988,116 +2135,137 @@ def simulate_rule_schedule(
     sub_repair_durations: pd.Series,
     sub_index: pd.Index,
     cfg: Config,
+    damage_probs: pd.DataFrame,      # <--- NEW: Required for Hazus curves
+    log_tag: str = None,
+    # initial_values removed (Obsolute)
 ) -> pd.DataFrame:
     """
-    Simulate a multi-crew repair schedule under a fixed task ordering.
-
-    Key behaviors (unchanged):
-      - Each crew starts at a yard base_id.
-      - If current_loc is a base_id: use Base->Task matrix.
-      - If current_loc is a substation: use Task->Task matrix.
-      - If a required entry is missing / non-finite: apply a hard fallback travel time (24.0 hr).
-      - Undamaged substations (repair_duration == 0) are marked completed at t=0.
-      - Returns a step-recovery matrix via simulate_step_recovery().
+    Simulate a multi-crew repair schedule and generate Hazus recovery curves.
     """
     logger = logging.getLogger()
 
+    # --- 1. Load and Fix Matrices ---
     base_to_task = travel_mats["base_to_task"].copy()
     task_to_task = travel_mats["task_to_task"].copy()
-
-    # Normalize IDs (string + strip) to avoid int/str mismatches
+    
+    # Normalize IDs (Strip whitespace and force string)
     base_to_task.index = base_to_task.index.astype(str).str.strip()
     base_to_task.columns = base_to_task.columns.astype(str).str.strip()
-
+    
     task_to_task.index = task_to_task.index.astype(str).str.strip()
     task_to_task.columns = task_to_task.columns.astype(str).str.strip()
 
+    # Normalize inputs
     order = [str(x).strip() for x in order]
     sub_index = pd.Index([str(x).strip() for x in sub_index])
-
+    
     sub_repair_durations = sub_repair_durations.copy()
     sub_repair_durations.index = sub_repair_durations.index.astype(str).str.strip()
 
-    # All yard IDs
     base_ids = list(base_to_task.index)
     base_id_set = set(base_ids)
 
-    # -------------------------------------------------------------------------
-    # 1) Initialize crew clocks and starting locations
-    # -------------------------------------------------------------------------
+    # --- 2. Initialize State ---
     crew_clocks = np.zeros(n_crews)
+    n_local = getattr(cfg, "N_CREWS_LOCAL", 15)   
+    n_local = min(n_local, n_crews)   
+    arrival_delay = getattr(cfg, "MUTUAL_AID_DELAY_HR", 8.0)
+    
+    crew_clocks[:n_local] = 0.0
+    if n_crews > n_local:
+        crew_clocks[n_local:] = arrival_delay
+        if log_tag: 
+            print(f"   -> [Logistics] {n_local} crews start at T=0, {n_crews - n_local} crews arrive at T={arrival_delay}h")
 
+    # Assign initial locations
     if base_ids:
         repeated = (base_ids * ((n_crews // len(base_ids)) + 1))[:n_crews]
         crew_locations = repeated.copy()
     else:
-        # Extreme fallback: no base info
         crew_locations = [None] * n_crews
 
-    # -------------------------------------------------------------------------
-    # 2) Initialize completion times for each substation
-    # -------------------------------------------------------------------------
+    # Track END times (Logistics). Default to Inf (never fixed).
     sub_end_times = pd.Series(np.inf, index=sub_index)
 
-    undamaged_subs = sub_repair_durations[sub_repair_durations <= cfg.UNDAMAGED_EPS_HR].index
-    sub_end_times.loc[undamaged_subs] = 0.0
-
-    # Task queue: only tasks that require repair
     task_queue = list(order)
-
-    # Precompute average Base->Task times (used only as a fallback)
     avg_base_to_task = base_to_task.mean(axis=0) if not base_to_task.empty else pd.Series(dtype=float)
 
-    # -------------------------------------------------------------------------
-    # 3) Main scheduling loop: dispatch the earliest-available crew to next task
-    # -------------------------------------------------------------------------
+    # Debug counter to limit print output
+    debug_miss_count = 0
+
+    # --- 3. Main Loop ---
     while task_queue:
         next_crew_idx = int(np.argmin(crew_clocks))
         current_time = float(crew_clocks[next_crew_idx])
-        current_loc = crew_locations[next_crew_idx]
+        
+        # Ensure current_loc is a clean string
+        raw_loc = crew_locations[next_crew_idx]
+        current_loc = str(raw_loc).strip() if raw_loc is not None else None
+        
+        next_task_id = str(task_queue.pop(0)).strip()
 
-        next_task_id = task_queue.pop(0)
-
-        # --- 3.1 Travel time ---
+        # 3.1 Calculate Travel Time
+        travel_time = 0.0
+        
         if current_loc in base_id_set:
-            # From yard/base
             try:
                 travel_time = float(base_to_task.loc[current_loc, next_task_id])
             except KeyError:
-                travel_time = float(avg_base_to_task.get(next_task_id, np.inf))
+                travel_time = float(avg_base_to_task.get(next_task_id, 24.0))
 
         elif current_loc is None:
-            # Extreme fallback: no base location info
-            travel_time = float(avg_base_to_task.get(next_task_id, np.inf))
+            travel_time = float(avg_base_to_task.get(next_task_id, 24.0))
 
         else:
-            # From previous substation
             try:
                 travel_time = float(task_to_task.loc[current_loc, next_task_id])
             except KeyError:
+                if debug_miss_count < 3:
+                    print(f"⚠️ [Travel Lookup Failed] {current_loc} -> {next_task_id}")
+                    debug_miss_count += 1
                 travel_time = np.inf
 
+        # Fallback
         if not np.isfinite(travel_time):
-            # Hard penalty: treat as nearly unreachable
             travel_time = 24.0
 
-        # --- 3.2 Completion time ---
+        # 3.2 Update Times
         arrival_time = current_time + travel_time
         repair_duration = float(sub_repair_durations.get(next_task_id, 0.0))
         end_time = arrival_time + repair_duration
 
+        # Log Gantt
+        if log_tag is not None:
+            GLOBAL_GANTT_LOG.append({
+                "Stage": log_tag,
+                "Crew_ID": next_crew_idx,
+                "Substation_ID": next_task_id,
+                "Start_Time": arrival_time,
+                "End_Time": end_time,
+                "Duration": repair_duration,
+                "Travel_Time": travel_time
+            })
+
         crew_clocks[next_crew_idx] = end_time
-        crew_locations[next_crew_idx] = next_task_id
+        crew_locations[next_crew_idx] = next_task_id 
 
         if next_task_id in sub_end_times.index:
             sub_end_times.loc[next_task_id] = end_time
-        else:
-            logger.warning(f"Task {next_task_id} not in sub_end_times index.")
 
-    # -------------------------------------------------------------------------
-    # 4) Convert completion times into step-recovery time series (Stage 3 helper)
-    # -------------------------------------------------------------------------
-    return simulate_step_recovery(sub_end_times.values, t_grid, sub_index)
+    # --- 4. Generate Hazus Recovery Curves ---
+    # We derived End Times above. The Hazus curve needs Start Time (Arrival).
+    # Start = End - Duration
+    # (Unvisited nodes remain Inf, so Start is Inf, so Recovery is 0. Correct.)
+    
+    aligned_durations = sub_repair_durations.reindex(sub_index, fill_value=0.0)
+    repair_starts = sub_end_times - aligned_durations
+
+    return simulate_recovery(
+        t_grid=t_grid, 
+        sub_index=sub_index, 
+        damage_probs=damage_probs,
+        start_times=repair_starts.values
+    )
 
 
 def get_analysis_weights(cfg: Config, stage_0_data: Dict) -> Tuple[np.ndarray, Optional[np.ndarray]]:
@@ -2136,7 +2304,7 @@ def get_analysis_weights(cfg: Config, stage_0_data: Dict) -> Tuple[np.ndarray, O
         pop_weights = np.ones(len(tract_index), dtype=float) / len(tract_index)
 
     # -------------------------------------------------------------------------
-    # 2) SVI * Population weights (optional)
+    # 2) SVI * Population weights
     # -------------------------------------------------------------------------
     svi_pop_weights: Optional[np.ndarray] = None
 
@@ -2189,21 +2357,15 @@ def get_analysis_weights(cfg: Config, stage_0_data: Dict) -> Tuple[np.ndarray, O
 
 
 def run_stage_4(
-    cfg,
+    cfg: Config,
     stage_3_data: dict,
     stage_0_data: dict,
     stage_2_data: dict,
-    stage_2_5_graph_data: dict,
     out_dirs: dict,
 ) -> dict:
     """
-    Stage 4B: rule-based scheduling baselines (with Population and optional SVI-weighted curves).
-
-    Output (per scenario):
-        - rule_curves_pop_{scenario}.csv
-        - rule_curves_svi_{scenario}.csv (if SVI weights available)
-        - rule_kpis_pop_{scenario}.csv
-        - rule_graphrobustness_{scenario}_{rule}.csv
+    Stage 4: Rule-based scheduling baselines (e.g., Centrality, Impact, Random).
+    Now uses Hazus Probabilistic Restoration.
     """
     if not cfg.RUN_STAGE_4:
         logging.info("--- STAGE 4: Skipped ---")
@@ -2211,103 +2373,138 @@ def run_stage_4(
 
     logger = logging.getLogger()
     logger.info("=" * 50)
-    logger.info("--- STAGE 4: Rule-Based Baselines (Modified for SVI) ---")
+    logger.info("--- STAGE 4: Rule-Based Baselines (Hazus Probabilistic) ---")
 
+    # =========================================================================
+    # 1. Load Context
+    # =========================================================================
+    W_mat = stage_0_data["W_mat"]
+    tract_index = stage_0_data["tract_index"]
+    sub_index = stage_0_data["sub_index"]
+    devices_df = stage_0_data["devices_merged"]
+
+    # Validation: Ensure Stage 3 results exist
     all_mean_sub_repair_times = stage_3_data.get("all_mean_sub_repair_times")
     if not all_mean_sub_repair_times:
         logger.error("FATAL: Missing 'all_mean_sub_repair_times'. Stage 3 might have failed.")
         return {}
 
-    W_mat = stage_0_data["W_mat"]
-    tract_index = stage_0_data["tract_index"]
-    sub_index = stage_0_data["sub_index"]
+    # NEW: Retrieve Damage Probabilities from Stage 3
+    all_damage_probs = stage_3_data.get("all_damage_probs")
+    if not all_damage_probs:
+        logger.error("FATAL: Missing 'all_damage_probs'. Stage 3 (Hazus Aggregation) must run first.")
+        return {}
 
-    G = stage_2_5_graph_data.get("G", nx.Graph())
+    # Load Graph
+    G = stage_2_data.get("G", nx.Graph())
+
+    # Simulation Grid
     t_grid = np.arange(0, cfg.TIME_END_HR + cfg.DT_HR, cfg.DT_HR)
 
-    rules = [
-        "centrality-first",   # Impact (lambda2)
-        "impact-first",       # Impact (population)
-        "betweenness-first",  # Bridges
-        "degree-first",       # Hubs
-        "closeness-first",    # Accessibility
-        "hospital-first",     # Critical facilities coverage
-        "random",             # Baseline
-    ]
-
-    # -------------------------------------------------------------------------
-    # Analysis weights (Population + optional SVI*Population)
-    # -------------------------------------------------------------------------
+    # Weights for Analysis
     pop_weights, svi_pop_weights = get_analysis_weights(cfg, stage_0_data)
     if svi_pop_weights is None:
         logger.warning("SVI weights not available. SVI curves will not be generated.")
 
-    # Separate result containers for Population-weighted vs SVI-weighted curves
-    results_pop: Dict[str, pd.DataFrame] = {}
-    results_svi: Dict[str, pd.DataFrame] = {}
+    # Rules to Simulate
+    rules = [
+        "centrality-first",
+        "impact-first",
+        "betweenness-first",
+        "degree-first",
+        "closeness-first",
+        "hospital-first",
+        "random",
+    ]
 
     out_dir = out_dirs["STAGE4_DIR"]
+    stage_4_data = {}
 
+    # =========================================================================
+    # 2. Main Simulation Loop (Per Scenario)
+    # =========================================================================
     for scenario in cfg.SCENARIOS:
         logger.info(f"Processing scenario: {scenario}...")
 
-        sub_repair_durations = all_mean_sub_repair_times[scenario]
+        if scenario not in all_mean_sub_repair_times:
+            continue
 
-        # Tasks = damaged substations only
-        tasks_to_do_series = sub_repair_durations[sub_repair_durations > 0]
+        # Get Scenario Data
+        sub_repair_durations = all_mean_sub_repair_times[scenario]
+        damage_probs = all_damage_probs[scenario]  # <--- NEW: The Hazus Weights
+
+        # Identify Damaged Substations (Logistics Only)
+        # We filter tasks for the scheduler based on mean repair time > 0
+        tasks_to_do_series = sub_repair_durations[sub_repair_durations > 0.001]
         task_sub_ids = list(tasks_to_do_series.index)
 
         if not task_sub_ids:
             logger.warning(f"No damaged substations for {scenario}. Skipping.")
             continue
 
-        # Travel matrices (Base->Task, Task->Task)
+        # Load Scenario-Specific Travel Matrices
         travel_mats = load_travel_matrices(
             cfg,
-            stage_0_data["devices_merged"],
+            devices_df,
             task_sub_ids,
             sub_index.to_list(),
         )
 
-        scenario_curves_pop: Dict[str, np.ndarray] = {}
-        scenario_curves_svi: Dict[str, np.ndarray] = {}
-        scenario_kpis_pop: Dict[str, pd.DataFrame] = {}
+        # Local Containers for this Scenario
+        scenario_curves_pop = {}
+        scenario_curves_svi = {}
+        scenario_kpis_pop = {}
+        scenario_kpis_svi = {}
 
+        # --- Run Each Rule ---
         for rule in rules:
             logger.info(f"   - Simulating rule: {rule}")
 
+            # A. Determine Repair Order
             order = order_substations(rule, task_sub_ids, stage_0_data, stage_2_data, cfg)
 
+            # B. Simulate Schedule & Recovery
+            # UPDATED CALL: Pass damage_probs, Remove initial_values
             R_sub_df = simulate_rule_schedule(
-                order,
-                cfg.N_CREWS,
-                travel_mats,
-                t_grid,
-                sub_repair_durations,
-                sub_index,
-                cfg,
+                order=order,
+                n_crews=cfg.N_CREWS,
+                travel_mats=travel_mats,
+                t_grid=t_grid,
+                sub_repair_durations=sub_repair_durations,
+                sub_index=sub_index,
+                cfg=cfg,
+                damage_probs=damage_probs,       # <--- Pass the Hazus data
+                log_tag=f"Stage4_{scenario}_{rule}",
+                # initial_values removed (Obsolute)
             )
 
+            # C. Propagate to Tracts (Tract = W * Substation)
             S_tract_df = propagate_to_tracts(R_sub_df, W_mat, tract_index)
 
-            # 1) Population-weighted system curve
+            # D. Compute Population-Weighted Curve
             system_curve_pop = S_tract_df.values @ pop_weights
             scenario_curves_pop[rule] = system_curve_pop
 
-            # KPIs (Population only, to preserve backward compatibility)
-            kpis = kpis_from_series(
+            kpis_pop = kpis_from_series(
                 pd.DataFrame({"system": system_curve_pop}, index=t_grid),
                 cfg.TIME_END_HR,
             )
-            kpis["rule"] = rule
-            scenario_kpis_pop[rule] = kpis
+            kpis_pop["rule"] = rule
+            scenario_kpis_pop[rule] = kpis_pop
 
-            # 2) SVI-weighted system curve (optional)
+            # E. Compute SVI-Weighted Curve (Optional)
             if svi_pop_weights is not None:
                 system_curve_svi = S_tract_df.values @ svi_pop_weights
                 scenario_curves_svi[rule] = system_curve_svi
 
-            # Dynamic graph robustness (unchanged)
+                kpis_svi = kpis_from_series(
+                    pd.DataFrame({"system": system_curve_svi}, index=t_grid),
+                    cfg.TIME_END_HR,
+                )
+                kpis_svi["rule"] = rule
+                scenario_kpis_svi[rule] = kpis_svi
+
+            # F. Compute Graph Robustness
             if G.number_of_nodes() > 0:
                 dyn_df = compute_graph_robustness(G, R_sub_df, t_grid, cfg)
                 dyn_df.to_csv(out_dir / f"rule_graphrobustness_{scenario}_{rule}.csv", index=False)
@@ -2317,236 +2514,332 @@ def run_stage_4(
                     index=False,
                 )
 
-        # ---------------------------------------------------------------------
-        # Write outputs
-        # ---------------------------------------------------------------------
+        # =====================================================================
+        # 3. Save Outputs (Disk & Memory)
+        # =====================================================================
         df_pop = pd.DataFrame(scenario_curves_pop, index=t_grid)
         df_pop.to_csv(out_dir / f"rule_curves_pop_{scenario}.csv", index_label="time_hr")
-        results_pop[scenario] = df_pop
 
+        df_svi = pd.DataFrame()
         if scenario_curves_svi:
             df_svi = pd.DataFrame(scenario_curves_svi, index=t_grid)
             df_svi.to_csv(out_dir / f"rule_curves_svi_{scenario}.csv", index_label="time_hr")
-            results_svi[scenario] = df_svi
 
+        kpis_pop_df = pd.DataFrame()
         if scenario_kpis_pop:
-            kpis_df = pd.concat(scenario_kpis_pop.values())
-            kpis_df.to_csv(out_dir / f"rule_kpis_pop_{scenario}.csv", index=False)
+            kpis_pop_df = pd.concat(scenario_kpis_pop.values())
+            kpis_pop_df.to_csv(out_dir / f"rule_kpis_pop_{scenario}.csv", index=False)
 
-        logger.info(f"Wrote rule-based curves (Pop & SVI) to {out_dir} for {scenario}")
+        kpis_svi_df = pd.DataFrame()
+        if scenario_kpis_svi:
+            kpis_svi_df = pd.concat(scenario_kpis_svi.values())
+            kpis_svi_df.to_csv(out_dir / f"rule_kpis_svi_{scenario}.csv", index=False)
+
+        logger.info(f"Wrote rule-based curves to {out_dir} for {scenario}")
+
+        stage_4_data[scenario] = {
+            "system_curves_pop": df_pop,
+            "kpis_pop": kpis_pop_df,
+            "system_curves_svi": df_svi,
+            "kpis_svi": kpis_svi_df,
+        }
+
+    # =========================================================================
+    # 4. Finalize
+    # =========================================================================
+    s4_gantt_data = [x for x in GLOBAL_GANTT_LOG if str(x.get("Stage", "")).startswith("Stage4")]
+    if s4_gantt_data:
+        df_s4 = pd.DataFrame(s4_gantt_data)
+        gantt_path = out_dir / "Gantt_Data_Stage4.csv"
+        df_s4.to_csv(gantt_path, index=False)
+        logger.info(f"SAVED GANTT DATA: {gantt_path} (Rows: {len(df_s4)})")
+    else:
+        logger.warning("No Gantt data found for Stage 4.")
 
     logger.info("--- STAGE 4 Complete ---")
-
-    # Return separated dicts for Stage 6 consumption
-    return {"pop": results_pop, "svi": results_svi}
+    return {"results": stage_4_data}
 
 
 # =============================================================================
 # Stage 5: Genetic Algorithm Optimization
 # =============================================================================
-
 def run_stage_5(
     cfg: Config,
     stage_0_data: Dict,
     stage_3_data: Dict,
     out_dirs: Dict,
 ) -> Dict:
+    """
+    Stage 5: Genetic Algorithm (GA) optimization (Multi-Policy).
+    Now uses Hazus Probabilistic Restoration.
+    """
     if not cfg.RUN_STAGE_5:
         logging.info("--- STAGE 5 (GA): Skipped ---")
         return {}
 
     logger = logging.getLogger()
     logger.info("=" * 50)
-    logger.info("--- STAGE 5: Genetic Algorithm Optimization (Evolutionary with Inversion Mutation) ---")
+    logger.info("--- STAGE 5: Genetic Algorithm Optimization (Hazus Probabilistic) ---")
 
-    # Prepare Data
+    # --- 1. Helpers & Inputs ---
+    def _clean_id(x): return str(x).split(".")[0].strip()
+    def _norm01(x, eps=1e-12):
+        x = np.asarray(x, dtype=float)
+        mn, mx = float(np.min(x)), float(np.max(x))
+        return (x - mn) / (mx - mn + eps)
+
     all_mean_sub = stage_3_data["all_mean_sub_repair_times"]
+    all_damage_probs = stage_3_data.get("all_damage_probs")
+    if not all_damage_probs:
+        logger.error("FATAL: Missing 'all_damage_probs'. Stage 3 must be run first.")
+        return {}
+
     W_mat = stage_0_data["W_mat"]
     sub_index = stage_0_data["sub_index"]
     tract_index = stage_0_data["tract_index"]
 
-    # --- Normalize indices to strings (avoid mismatched int/str ids)
-    sub_index_str = [str(s).strip() for s in list(sub_index)]
+    sub_index_str = [_clean_id(s) for s in list(sub_index)]
+    sub_idx_map = {sid: i for i, sid in enumerate(sub_index_str)}
+    out_dir_s5 = out_dirs["STAGE5_DIR"]
+
+    # --- Build base graph once for GA graph-robustness export ---
+    devices_merged = stage_0_data["devices_merged"].copy()
+    devices_merged = ensure_substation_id_col(devices_merged)
+    devices_merged["substation_id"] = devices_merged["substation_id"].astype(str).str.strip()
+
+    G = build_base_graph(cfg, devices_merged, sub_index)
+
+    # --- 2. Prepare Importance Vectors ---
+    mapping_df = stage_0_data["mapping_df"]
     tract_index_str = pd.Index(tract_index).astype(str).str.split(".").str[0].str.strip()
 
-    # --- Hospital score (optional)
+    pop_per_tract = mapping_df.groupby("tract_id")["population"].first()
+    pop_per_tract.index = pop_per_tract.index.astype(str).str.split(".").str[0].str.strip()
+    pop_vec = pop_per_tract.reindex(tract_index_str).fillna(0.0).values
+    pop_imp = pop_vec @ W_mat
+
+    pop_w_global, svi_pop_w_global = get_analysis_weights(cfg, stage_0_data)
+    has_svi = svi_pop_w_global is not None
+    svi_imp = (np.asarray(svi_pop_w_global, dtype=float) @ W_mat) if has_svi else np.zeros(len(sub_index_str))
+
     try:
         hosp_df = pd.read_csv(cfg.HOSPITAL_TRACTS_CSV)
-
         geo_col = "geoid"
-        if geo_col not in hosp_df.columns:
-            for cand in ["GEOID", "tract_id", "TRACTFIPS"]:
-                if cand in hosp_df.columns:
-                    geo_col = cand
-                    break
-
+        for cand in ["GEOID", "tract_id", "TRACTFIPS"]:
+            if cand in hosp_df.columns:
+                geo_col = cand
+                break
         hosp_ids = set(hosp_df[geo_col].astype(str).str.split(".").str[0].str.strip())
         is_hosp = pd.Series(0.0, index=tract_index_str)
         is_hosp.loc[is_hosp.index.isin(hosp_ids)] = 1.0
-
-        # is_hosp: (n_tract,), W_mat: (n_tract, n_sub) => sub_hosp_score: (n_sub,)
         sub_hosp_score = is_hosp.values @ W_mat
-    except Exception as e:
-        logger.warning(f"Hospital score unavailable; using zeros. Reason: {e}")
-        sub_hosp_score = np.zeros(len(sub_index_str), dtype=float)
+    except Exception:
+        sub_hosp_score = np.zeros(len(sub_index_str))
 
-    # DEAP creator guards
+    # --- 3. DEAP (GA) Setup ---
     if not hasattr(creator, "FitnessMax"):
         creator.create("FitnessMax", base.Fitness, weights=(1.0,))
     if not hasattr(creator, "Individual"):
         creator.create("Individual", list, fitness=creator.FitnessMax)
 
     toolbox = base.Toolbox()
+    def mutInversion(individual, indpb):
+        if random.random() < indpb:
+            size = len(individual)
+            if size < 2:
+                return (individual,)
+            a, b = random.sample(range(size), 2)
+            if a > b:
+                a, b = b, a
+            individual[a : b + 1] = individual[a : b + 1][::-1]
+        return (individual,)
+    toolbox.register("mate", tools.cxOrdered)
+    toolbox.register("mutate", mutInversion, indpb=0.2)
+    toolbox.register("select", tools.selTournament, tournsize=3)
 
-    # Precompute population impact per substation (aligned to sub_index)
-    pop_per_tract = (
-        stage_0_data["mapping_df"]
-        .groupby("tract_id")["population"]
-        .first()
-    )
-    pop_per_tract.index = pop_per_tract.index.astype(str).str.split(".").str[0].str.strip()
-    pop_vec = pop_per_tract.reindex(tract_index_str).fillna(0.0).values  # (n_tract,)
-    pop_imp = pop_vec @ W_mat  # (n_sub,)
+    combined_results_pop = {}
+    combined_results_svi = {}
 
-    sub_idx_map = {sid: i for i, sid in enumerate(sub_index_str)}
-
-    ga_results = {}
-
+    # --- 4. Main Loop: Scenarios ---
     for scenario in cfg.SCENARIOS:
-        logger.info(f"Running GA for {scenario}...")
+        logger.info(f"Processing Scenario: {scenario}...")
+        combined_results_pop[scenario] = {}
+        combined_results_svi[scenario] = {}
 
-        run_seed = cfg.RNG_SEED + abs(hash(scenario))
-        random.seed(run_seed)
-        logger.info(f"  > GA Random Seed set to: {run_seed}")
+        if scenario not in all_mean_sub:
+            continue
 
         repair_times = all_mean_sub[scenario]
+        damage_probs = all_damage_probs[scenario]
+
+        # Identify tasks (Logistics uses repair time > 0 to identify candidates)
         tasks = repair_times[repair_times > 0.1]
         task_ids = list(tasks.index)
         n_tasks = len(task_ids)
-
         if n_tasks == 0:
             continue
 
-        # Travel matrices (restricted to task list)
         tmats = load_travel_matrices(cfg, stage_0_data["devices_merged"], task_ids, list(sub_index))
-        base_mat = tmats["base_to_task"].values   # (n_bases, n_tasks)
-        task_mat = tmats["task_to_task"].values   # (n_tasks, n_tasks)
-
-        # --- Fixed base assignment for crews (CRITICAL FIX)
+        base_mat = tmats["base_to_task"].values
+        task_mat = tmats["task_to_task"].values
         n_bases = int(base_mat.shape[0])
-        crew_base_idx = np.array(
-            (list(range(n_bases)) * ((cfg.N_CREWS // n_bases) + 1))[: cfg.N_CREWS],
-            dtype=int,
-        )
+        crew_base_idx = np.array((list(range(n_bases)) * ((cfg.N_CREWS // n_bases) + 1))[: cfg.N_CREWS], dtype=int)
 
-        # Align task ids to global sub indices
-        task_ids_str = [str(t).strip() for t in task_ids]
-        global_idxs = []
-        for t in task_ids_str:
-            if t not in sub_idx_map:
-                raise ValueError(f"[GA] Task substation id '{t}' not found in sub_index.")
-            global_idxs.append(sub_idx_map[t])
+        global_idxs = [sub_idx_map[_clean_id(t)] for t in task_ids]
+        pop_n = _norm01(pop_imp[global_idxs])
+        hosp_n = _norm01(sub_hosp_score[global_idxs])
+        svi_n = _norm01(svi_imp[global_idxs])
+        task_times = tasks.values
 
-        task_vals = cfg.W_POP * pop_imp[global_idxs] + cfg.W_HOSP * sub_hosp_score[global_idxs]
-        task_times = tasks.values  # aligned with task_ids order
+        for policy_name, weights in cfg.GA_SCENARIOS_CONFIG.items():
+            logger.info(f"  > Running GA Policy: {policy_name} {weights}")
 
-        def eval_sched(ind):
-            clocks = np.zeros(cfg.N_CREWS, dtype=float)
-            locs = np.full(cfg.N_CREWS, -1, dtype=int)
-            end_times = np.zeros(n_tasks, dtype=float)
+            W_POP, W_HOSP, W_MAKESPAN = weights["W_POP"], weights["W_HOSP"], weights["W_MAKESPAN"]
+            W_SVI = getattr(cfg, "W_SVI", 0.0) if has_svi else 0.0
 
-            for t_idx in ind:
-                c = int(np.argmin(clocks))
-                prev = int(locs[c])
+            task_vals = W_POP * pop_n + W_HOSP * hosp_n + W_SVI * svi_n
+            T_MAX = float(cfg.TIME_END_HR) + float(cfg.GA_EXTRA_EVAL_HR)
 
-                # Travel time:
-                # - First task: from crew's assigned base ONLY (no min over all bases).
-                # - Otherwise: from previous task.
+            def eval_sched(ind):
+                clocks = np.zeros(cfg.N_CREWS)
+                locs = np.full(cfg.N_CREWS, -1, dtype=int)
+                end_times = np.zeros(n_tasks)
+                for t_idx in ind:
+                    c = int(np.argmin(clocks))
+                    prev = int(locs[c])
+                    travel = float(base_mat[crew_base_idx[c], t_idx]) if prev == -1 else float(task_mat[prev, t_idx])
+                    start = clocks[c] + travel
+                    end = start + float(task_times[t_idx])
+                    clocks[c], locs[c], end_times[int(t_idx)] = end, int(t_idx), end
+
+                valid = end_times < T_MAX
+                score = np.sum(task_vals[valid] * (T_MAX - end_times[valid]))
+                score -= W_MAKESPAN * np.max(clocks)
+                return (score,)
+
+            toolbox.register("evaluate", eval_sched)
+
+            random.seed(cfg.RNG_SEED + abs(hash(scenario)) + abs(hash(policy_name)))
+            pop = [creator.Individual(random.sample(range(n_tasks), n_tasks)) for _ in range(cfg.GA_POP_SIZE - 2)]
+            pop.append(creator.Individual(np.argsort(task_vals)[::-1].tolist()))
+            pop.append(creator.Individual(np.argsort(task_times).tolist()))
+
+            pop, _ = algorithms.eaSimple(
+                pop,
+                toolbox,
+                cxpb=cfg.GA_CXPB,
+                mutpb=cfg.GA_MUTPB,
+                ngen=cfg.GA_N_GEN,
+                verbose=False,
+            )
+
+            best_ind = tools.selBest(pop, 1)[0]
+            best_order = [task_ids[i] for i in best_ind]
+
+            # --- Export Detailed Schedule for Visualization ---
+            schedule_rows = []
+        
+            sim_clocks = np.zeros(cfg.N_CREWS)
+            if hasattr(cfg, "N_CREWS_LOCAL") and hasattr(cfg, "MUTUAL_AID_DELAY_HR"):
+                sim_clocks[cfg.N_CREWS_LOCAL:] = cfg.MUTUAL_AID_DELAY_HR
+            
+            sim_locs = np.full(cfg.N_CREWS, -1, dtype=int)
+            
+            for rank, t_idx in enumerate(best_ind):
+                c = int(np.argmin(sim_clocks))
+                prev = int(sim_locs[c])
                 if prev == -1:
                     travel = float(base_mat[crew_base_idx[c], t_idx])
                 else:
                     travel = float(task_mat[prev, t_idx])
+            
+                start_time = sim_clocks[c] + travel
+                duration = float(task_times[t_idx])
+                finish_time = start_time + duration
+                
+                sim_clocks[c] = finish_time
+                sim_locs[c] = int(t_idx)
+                
+                r_type = "Local"
+                if hasattr(cfg, "N_CREWS_LOCAL") and c >= cfg.N_CREWS_LOCAL:
+                    r_type = "MutualAid"
+                
+                schedule_rows.append({
+                    "repair_order": rank + 1,
+                    "substation_id": task_ids[t_idx],
+                    "Crew_ID": c,           
+                    "Resource_Type": r_type,
+                    "Start_Time": start_time,
+                    "Finish_Time": finish_time,
+                    "Travel_Time": travel,
+                    "Duration": duration
+                })
+   
+            out_csv_path = out_dir_s5 / f"GA_Schedule_{scenario}_{policy_name}.csv"
+            pd.DataFrame(schedule_rows).to_csv(out_csv_path, index=False)
+            logger.info(f"  -> Saved detailed schedule: {out_csv_path}")
 
-                start = clocks[c] + travel
-                end = start + float(task_times[t_idx])
+            t_grid = np.arange(0, cfg.TIME_END_HR + cfg.DT_HR, cfg.DT_HR)
 
-                clocks[c] = end
-                locs[c] = int(t_idx)
-                end_times[int(t_idx)] = end
+            R_sub = simulate_rule_schedule(
+                order=best_order,
+                n_crews=cfg.N_CREWS,
+                travel_mats=tmats,
+                t_grid=t_grid,
+                sub_repair_durations=repair_times,
+                sub_index=sub_index,
+                cfg=cfg,
+                damage_probs=damage_probs, 
+            )
 
-            T_MAX = float(cfg.TIME_END_HR) + float(cfg.GA_EXTRA_EVAL_HR)
-            valid = end_times < T_MAX
+            # --- Export GA dynamic graph robustness (per scenario, per GA policy) ---
+            out_path = out_dir_s5 / f"ga_graphrobustness_{scenario}_{policy_name}.csv"
 
-            score = float(np.sum(task_vals[valid] * (T_MAX - end_times[valid])))
-            score -= float(cfg.W_MAKESPAN) * float(np.max(clocks)) * float(np.mean(task_vals))
-            return (score,)
+            if G.number_of_nodes() > 0:
+                dyn_df = compute_graph_robustness(G, R_sub, t_grid, cfg)
+                dyn_df.to_csv(out_path, index=False)
+            else:
+                pd.DataFrame(
+                    {"t": [0], "lcc_size": [0], "avg_degree": [0.0], "lcc_fraction": [0.0]}
+                ).to_csv(out_path, index=False)
 
-        # Inversion mutation
-        def mutInversion(individual, indpb):
-            """Inversion Mutation: reverse a random subsequence with probability indpb."""
-            if random.random() < indpb:
-                size = len(individual)
-                if size < 2:
-                    return (individual,)
-                a, b = random.sample(range(size), 2)
-                if a > b:
-                    a, b = b, a
-                individual[a:b+1] = individual[a:b+1][::-1]
-            return (individual,)
+            S_tract = propagate_to_tracts(R_sub, W_mat, tract_index)
 
-        # Register operators
-        toolbox.register("evaluate", eval_sched)
-        toolbox.register("mate", tools.cxOrdered)
-        toolbox.register("mutate", mutInversion, indpb=0.2)
-        toolbox.register("select", tools.selTournament, tournsize=3)
+            curve_pop = S_tract.values @ pop_w_global
+            combined_results_pop[scenario][policy_name] = pd.Series(curve_pop, index=t_grid)
+            pd.DataFrame({f"GA_{policy_name}": curve_pop}, index=t_grid).to_csv(
+                out_dir_s5 / f"GA_Curve_Pop_{scenario}_{policy_name}.csv"
+            )
 
-        # Init population
-        pop = []
-        for _ in range(cfg.GA_POP_SIZE - 2):
-            p = list(range(n_tasks))
-            random.shuffle(p)
-            pop.append(creator.Individual(p))
-        pop.append(creator.Individual(np.argsort(task_vals)[::-1].tolist()))
-        pop.append(creator.Individual(np.argsort(task_times).tolist()))
+            if has_svi:
+                curve_svi = S_tract.values @ svi_pop_w_global
+                combined_results_svi[scenario][policy_name] = pd.Series(curve_svi, index=t_grid)
+                pd.DataFrame({f"GA_{policy_name}": curve_svi}, index=t_grid).to_csv(
+                    out_dir_s5 / f"GA_Curve_SVI_{scenario}_{policy_name}.csv"
+                )
 
-        algo_stats = tools.Statistics(lambda ind: ind.fitness.values)
-        algo_stats.register("max", np.max)
+            if policy_name == "Balanced":
+                kpis = kpis_from_series(S_tract, cfg.TIME_END_HR)
+                kpi_path = out_dir_s5 / f"tract_kpis_{scenario}.csv"
+                kpis.to_csv(kpi_path, index_label="tract_id")
+                logger.info(f"  -> Saved Stage 7 input: {kpi_path}")
 
-        # Run GA
-        pop, log = algorithms.eaSimple(
-            pop,
-            toolbox,
-            cxpb=cfg.GA_CXPB,
-            mutpb=cfg.GA_MUTPB,
-            ngen=cfg.GA_N_GEN,
-            verbose=False,
-            stats=algo_stats,
-        )
+    # --- 5. Format Output for Stage 6 ---
+    out = {"pop": {}, "svi": {}}
 
-        best_ind = tools.selBest(pop, 1)[0]
-        logger.info(f"  > Gen {cfg.GA_N_GEN} Best Fitness: {best_ind.fitness.values[0]:.2e}")
+    for scen, policies in combined_results_pop.items():
+        df_combined = pd.DataFrame(policies)
+        df_combined.index.name = "time_hr"
+        out["pop"][scen] = df_combined
 
-        best_order = [task_ids[i] for i in best_ind]
+    for scen, policies in combined_results_svi.items():
+        df_combined = pd.DataFrame(policies)
+        df_combined.index.name = "time_hr"
+        out["svi"][scen] = df_combined
 
-        # Build recovery curve (population-weighted)
-        t_grid = np.arange(0, cfg.TIME_END_HR + cfg.DT_HR, cfg.DT_HR)
-
-        # Use full repair_times series for safety (tasks is subset; either works if simulate_rule_schedule handles it)
-        R_sub = simulate_rule_schedule(best_order, cfg.N_CREWS, tmats, t_grid, repair_times, sub_index, cfg)
-        S_tract = propagate_to_tracts(R_sub, W_mat, tract_index)
-
-        pop_w, _ = get_analysis_weights(cfg, stage_0_data)
-        curve = S_tract.values @ pop_w
-
-        ga_results[scenario] = pd.Series(curve, index=t_grid, name="GA_Best")
-
-    out = {"pop": {}}
-    for scen, ser in ga_results.items():
-        df = pd.DataFrame({"GA_Best": ser})
-        df.index.name = "time_hr"
-        out["pop"][scen] = df
-
+    logger.info("--- STAGE 5 Complete ---")
     return out
+
 
 # ==========================================================================
 # [PART 7] Stage 6: Visualization & Results Consolidation
@@ -2566,7 +2859,7 @@ def run_stage_6(
     Consolidates:
       - Stage 3 theoretical (unconstrained) system recovery curves
       - Stage 4B rule-based scheduling system recovery curves
-      - Stage 5 GA-optimized system recovery curves (if provided via stage_5_data)
+      - Stage 5 GA-optimized system recovery curves (Multi-Policy)
 
     Produces:
       - Per-scenario plots (Population-weighted and optional SVI-weighted)
@@ -2579,7 +2872,7 @@ def run_stage_6(
 
     logger = logging.getLogger()
     logger.info("=" * 50)
-    logger.info("--- STAGE 6: Consolidation & Separate Plotting (Adaptive X; GA optional) ---")
+    logger.info("--- STAGE 6: Consolidation & Separate Plotting (Adaptive X; GA Multi-Policy) ---")
 
     out_dir = out_dirs["STAGE6_DIR"]
     t_grid = np.arange(0, cfg.TIME_END_HR + cfg.DT_HR, cfg.DT_HR)
@@ -2598,20 +2891,27 @@ def run_stage_6(
     # -------------------------------------------------------------------------
     # 3) Plot styling
     # -------------------------------------------------------------------------
+    # Keys must match the labels generated in steps B/C (e.g. "GA_Balanced")
     style_config = {
-        "GA_Best":           ("GA Optimized", "purple", "-", 3.5, 1.0, 10),
+        # --- GA Policies (Stage 5) ---
+        "GA_Balanced":       ("GA (Balanced)",   "purple",      "-",  2.5, 0.9, 10),
+        "GA_HospFirst":      ("GA (HospFirst)",  "magenta",     "-",  2.0, 0.8, 9),
+        "GA_Efficiency":     ("GA (Efficiency)", "teal",        "-",  2.0, 0.8, 9),
+        
+        # --- Fallback if single policy ---
+        "GA_Best":           ("GA Optimized",    "purple",      "-",  2.5, 0.8, 10),
 
-        # Stage 3 theoretical limit
-        "S3_Mean": ("Theoretical Limit (Unconstrained)", "black", "--", 2.0, 0.6, 1),
+        # --- Theoretical Limit (Stage 3) ---
+        "S3_Mean":           ("Theoretical Limit", "black",     "--", 1.8, 1.0, 11),
 
-        # Rule-based baselines (Stage 4B)
-        "centrality-first":  ("Impact λ2-First (Grid Topo)",      "#e41a1c",   "-", 3.0, 0.9, 3),
-        "impact-first":      ("Impact-First (Population)",        "#ff7f00",   "-", 3.0, 0.9, 4),
-        "betweenness-first": ("Betweenness-First (Bridges)",      "#ffd92f",   "-", 3.0, 0.9, 5),
-        "degree-first":      ("Degree-First (Hubs)",              "#4daf4a",   "-", 3.0, 0.9, 6),
-        "closeness-first":   ("Closeness-First (Accessibility)",  "#377eb8",   "-", 3.0, 0.9, 7),
-        "hospital-first":    ("Hospital-First (Critical)",        "#555555",   "-", 3.0, 0.9, 8),
-        "random":            ("Baseline (Random)",                "lightgray", ":", 2.5, 0.9, 2),
+        # --- Heuristics (Stage 4) ---
+        "centrality-first":  ("Impact λ2 (Grid)", "#e41a1c",    "-.", 1.5, 0.7, 5),
+        "betweenness-first": ("Betweenness",      "#ffd92f",    "-.", 1.5, 0.7, 5),
+        "impact-first":      ("Impact (Pop)",     "#ff7f00",    ":",  1.8, 0.7, 4),
+        "degree-first":      ("Degree (Hubs)",    "#4daf4a",    "--", 1.5, 0.7, 6),
+        "closeness-first":   ("Closeness",        "#377eb8",    "--", 1.5, 0.7, 7),
+        "hospital-first":    ("Hospital First",   "#555555",    "-",  1.5, 0.6, 3),
+        "random":            ("Random Baseline",  "lightgray",  "-",  4.0, 0.4, 1), 
     }
 
     # -------------------------------------------------------------------------
@@ -2628,7 +2928,6 @@ def run_stage_6(
             s = s.reindex(t_grid)
             s = s.ffill().bfill()
         except Exception:
-            # If anything goes wrong, just return original series.
             return series
         return s
 
@@ -2638,19 +2937,15 @@ def run_stage_6(
     def plot_single_scenario(scenario_name: str, data_dict: Dict[str, pd.Series], weight_type: str) -> None:
         """
         Plot a single scenario's recovery curves.
-
-        Args:
-            scenario_name: scenario label
-            data_dict: mapping {curve_key -> pd.Series(time->value)}
-            weight_type: "Population" or "SVI_Weighted"
+        Only plots curves defined in style_config to ensure consistent legend order.
         """
         try:
             sns.set_style("whitegrid")
-            sns.set_context("talk", font_scale=1.2)
+            sns.set_context("talk", font_scale=1.0)
         except Exception:
             plt.style.use("ggplot")
 
-        fig, ax = plt.subplots(figsize=(10, 7))
+        fig, ax = plt.subplots(figsize=(12, 8))
 
         plotted_series: List[pd.Series] = []
         has_plotted = False
@@ -2663,13 +2958,13 @@ def run_stage_6(
             series = _align_to_tgrid(data_dict[key])
             plotted_series.append(series)
 
-            # Legend label tweaks for SVI plot (only these two labels change)
+            # Legend label tweaks for SVI plot
             final_label = label
             if weight_type == "SVI_Weighted":
                 if key == "impact-first":
-                    final_label = "Impact-First (SVI-Adjusted)"
+                    final_label = "Impact-First (SVI)"
                 elif key == "S3_Mean":
-                    final_label = "Theoretical Limit (SVI-Weighted)"
+                    final_label = "Theoretical Limit (SVI)"
 
             ax.plot(
                 series.index,
@@ -2702,21 +2997,22 @@ def run_stage_6(
         suffix = " (SVI Weighted)" if weight_type == "SVI_Weighted" else " (Population Weighted)"
         ax.set_title(
             f"System Recovery: {scenario_name}{suffix}",
-            fontsize=20,
+            fontsize=18,
             fontweight="bold",
-            pad=14,
+            pad=15,
         )
 
-        y_label = "Functionality (%)" if weight_type == "Population" else "SVI-Weighted Recovery (%)"
-        ax.set_ylabel(y_label, fontsize=18)
-        ax.set_xlabel("Time (Hours)", fontsize=18)
+        y_label = "Functionality" if weight_type == "Population" else "SVI-Weighted Recovery"
+        ax.set_ylabel(y_label, fontsize=16)
+        ax.set_xlabel("Time (Hours)", fontsize=16)
         ax.set_ylim(-0.02, 1.05)
-        ax.tick_params(axis="both", labelsize=16)
+        ax.tick_params(axis="both", labelsize=14)
 
         if has_plotted:
-            leg = ax.legend(loc="lower right", framealpha=0.95, fontsize=14)
+            # Move legend outside if too crowded, or keep inside top-left/right
+            leg = ax.legend(loc="lower right", framealpha=0.95, fontsize=12, ncol=1)
             if leg.get_title() is not None:
-                leg.get_title().set_fontsize(14)
+                leg.get_title().set_fontsize(12)
 
         ax.grid(True, linestyle="--", alpha=0.6)
 
@@ -2766,53 +3062,98 @@ def run_stage_6(
                 all_kpis.append(kpis_svi)
 
         # ---------------------------------------------------------------------
-        # B) Stage 4B rule-based scheduling curves
+        # B) Stage 4 rule-based scheduling curves
         # ---------------------------------------------------------------------
-        s4b_pop_data = stage_4_data.get("pop", {}).get(scenario)
-        s4b_svi_data = stage_4_data.get("svi", {}).get(scenario)
-
-        if s4b_pop_data is not None:
-            for rule in s4b_pop_data.columns:
-                series = _align_to_tgrid(s4b_pop_data[rule])
-                current_pop_curves[rule] = series
-                all_system_curves[f"{scenario}_S4B_{rule}_Pop"] = series
-
-                kpis = kpis_from_series(pd.DataFrame({rule: series}), cfg.TIME_END_HR)
-                kpis["scenario"] = scenario
-                kpis["rule"] = f"Stage4B_{rule}"
-                all_kpis.append(kpis)
-
-        if s4b_svi_data is not None:
-            for rule in s4b_svi_data.columns:
-                series = _align_to_tgrid(s4b_svi_data[rule])
-                current_svi_curves[rule] = series
-                all_system_curves[f"{scenario}_S4B_{rule}_SVI"] = series
-
-        # ---------------------------------------------------------------------
-        # C) Stage 5 GA curves
-        # ---------------------------------------------------------------------
-        if stage_5_data and isinstance(stage_5_data, dict) and "pop" in stage_5_data:
-            ga_scen = stage_5_data["pop"].get(scenario)
-
-            if ga_scen is not None and isinstance(ga_scen, pd.DataFrame) and "GA_Best" in ga_scen.columns:
-                series = _align_to_tgrid(ga_scen["GA_Best"])
-
-                current_pop_curves["GA_Best"] = series
-                all_system_curves[f"{scenario}_GA_Best_Pop"] = series
-
-                # KPIs
-                kpis = kpis_from_series(pd.DataFrame({"GA_Best": series}), cfg.TIME_END_HR)
-                kpis["scenario"] = scenario
-                kpis["rule"] = "Stage5_GA"
-                all_kpis.append(kpis)
+        s4_results = stage_4_data.get("results", {})
+        
+        if scenario in s4_results:
+            scen_data = s4_results[scenario]
+            
+            # --- 1. Population Curves (from memory) ---
+            s4_pop_data = scen_data.get("system_curves_pop")
+            if s4_pop_data is not None and not s4_pop_data.empty:
+                for rule in s4_pop_data.columns:
+                    series = _align_to_tgrid(s4_pop_data[rule])
+                    current_pop_curves[rule] = series
+                    all_system_curves[f"{scenario}_S4_{rule}_Pop"] = series
+                
+                # Retrieve KPIs from memory
+                kpi_pop_df = scen_data.get("kpis_pop")
+                if kpi_pop_df is not None:
+                    # Make a copy to avoid modifying the original dict in place
+                    kpi_pop_df = kpi_pop_df.copy()
+                    kpi_pop_df["scenario"] = scenario
+                    kpi_pop_df["rule"] = "Stage4_" + kpi_pop_df["rule"].astype(str)
+                    all_kpis.append(kpi_pop_df)
             else:
-                logger.info(f"GA output not found for scenario={scenario} (or missing 'GA_Best').")
+                logger.warning(f"Stage 4 results found for {scenario}, but 'system_curves_pop' is empty.")
+
+            # --- 2. SVI Curves (from memory, optional) ---
+            if svi_pop_weights is not None:
+                s4_svi_data = scen_data.get("system_curves_svi")
+                if s4_svi_data is not None and not s4_svi_data.empty:
+                    for rule in s4_svi_data.columns:
+                        series = _align_to_tgrid(s4_svi_data[rule])
+                        current_svi_curves[rule] = series
+                        all_system_curves[f"{scenario}_S4_{rule}_SVI"] = series
+                    
+                    # Retrieve KPIs from memory
+                    kpi_svi_df = scen_data.get("kpis_svi")
+                    if kpi_svi_df is not None:
+                        kpi_svi_df = kpi_svi_df.copy()
+                        kpi_svi_df["scenario"] = scenario
+                        kpi_svi_df["rule"] = "Stage4_" + kpi_svi_df["rule"].astype(str) + "_SVIpop"
+                        all_kpis.append(kpi_svi_df)
+        else:
+            logger.warning(f"No Stage 4 in-memory data found for scenario: {scenario}")
+
+        # ---------------------------------------------------------------------
+        # C) Stage 5 GA curves (Multi-Policy Support)
+        # ---------------------------------------------------------------------
+        if stage_5_data and isinstance(stage_5_data, dict):
+            # C1: Population Weighted
+            if "pop" in stage_5_data:
+                ga_pop_df = stage_5_data["pop"].get(scenario)
+                if ga_pop_df is not None and not ga_pop_df.empty:
+                    # Iterate through all available policy columns (Balanced, HospFirst, Efficiency)
+                    for policy_name in ga_pop_df.columns:
+                        series_pop = _align_to_tgrid(ga_pop_df[policy_name])
+                        
+                        # Label format matches style_config keys: "GA_Balanced", "GA_HospFirst"
+                        label = f"GA_{policy_name}" 
+
+                        current_pop_curves[label] = series_pop
+                        all_system_curves[f"{scenario}_{label}_Pop"] = series_pop
+
+                        # Calculate KPIs
+                        kpis_pop = kpis_from_series(pd.DataFrame({"system": series_pop}), cfg.TIME_END_HR)
+                        kpis_pop["scenario"] = scenario
+                        kpis_pop["rule"] = f"Stage5_{label}" 
+                        all_kpis.append(kpis_pop)
+
+            # C2: SVI Weighted (Optional)
+            if svi_pop_weights is not None and "svi" in stage_5_data:
+                ga_svi_df = stage_5_data["svi"].get(scenario)
+                if ga_svi_df is not None and not ga_svi_df.empty:
+                    for policy_name in ga_svi_df.columns:
+                        series_svi = _align_to_tgrid(ga_svi_df[policy_name])
+                        label = f"GA_{policy_name}"
+
+                        current_svi_curves[label] = series_svi
+                        all_system_curves[f"{scenario}_{label}_SVI"] = series_svi
+
+                        kpis_svi = kpis_from_series(pd.DataFrame({"system": series_svi}), cfg.TIME_END_HR)
+                        kpis_svi["scenario"] = scenario
+                        kpis_svi["rule"] = f"Stage5_{label}_SVI"
+                        all_kpis.append(kpis_svi)
 
         # ---------------------------------------------------------------------
         # D) Plotting
         # ---------------------------------------------------------------------
         if current_pop_curves:
             plot_single_scenario(scenario, current_pop_curves, "Population")
+        else:
+            logger.warning(f"No population curves found for {scenario}, skipping plot.")
 
         if current_svi_curves and svi_pop_weights is not None:
             plot_single_scenario(scenario, current_svi_curves, "SVI_Weighted")
@@ -2822,7 +3163,7 @@ def run_stage_6(
     # -------------------------------------------------------------------------
     if all_system_curves:
         all_curves_df = pd.DataFrame(all_system_curves)
-        all_curves_df = all_curves_df.reindex(t_grid)  # enforce unified time index in CSV
+        all_curves_df = all_curves_df.reindex(t_grid)
         all_curves_df.to_csv(out_dir / "recovery_curves_all_system.csv", index_label="time_hr")
 
     if all_kpis:
@@ -2866,86 +3207,71 @@ def run_stage_7(
         keep numeric part only, drop decimal suffix, and strip leading zeros
         (e.g., 06001400100 -> 6001400100).
         """
+        s = series.astype(str).str.strip()
         return (
-            series.astype(str)
-            .str.split(".")
-            .str[0]
-            .str.extract(r"(\d+)")[0]
-            .str.lstrip("0")
+            s.str.split(".").str[0]
+             .str.extract(r"(\d+)")[0]
+             .str.lstrip("0")
         )
 
     # ---------------------------------------------------------
-    # A. Recovery Metrics (from Stage 3)
+    # A. Recovery Metrics (from Stage 5 GA) - single scenario
     # ---------------------------------------------------------
-    dynamic_rows = []
-    for scen in cfg.SCENARIOS:
-        s3_kpi_path = out_dirs["STAGE3_DIR"] / f"tract_kpis_{scen}.csv"
-        if not s3_kpi_path.exists():
-            continue
+    target_scen = "2pc50"
 
-        df_s3 = pd.read_csv(s3_kpi_path)
-        if "tract_id" not in df_s3.columns:
-            df_s3.rename(columns={df_s3.columns[0]: "tract_id"}, inplace=True)
+    s5_kpi_path = out_dirs["STAGE5_DIR"] / f"tract_kpis_{target_scen}.csv"
+    if not s5_kpi_path.exists():
+        raise FileNotFoundError(f"Missing Stage 5 tract KPI file: {s5_kpi_path}")
 
-        df_s3["tract_id"] = df_s3["tract_id"].astype(str).str.split(".").str[0]
-        for _, row in df_s3.iterrows():
-            dynamic_rows.append(
-                {
-                    "tract_id": row["tract_id"],
-                    "scenario": scen,
-                    "T50": row.get("T50", 0),
-                    "T80": row.get("T80", 0),
-                    "AUC": row.get("AUC", 0),
-                }
-            )
+    df_s5 = pd.read_csv(s5_kpi_path)
+    if "tract_id" not in df_s5.columns:
+        df_s5.rename(columns={df_s5.columns[0]: "tract_id"}, inplace=True)
 
-    if not dynamic_rows:
-        return {}
+    df_s5["tract_id"] = df_s5["tract_id"].astype(str).str.split(".").str[0].str.strip()
+    df_s5["scenario"] = target_scen
 
-    df_main_raw = pd.DataFrame(dynamic_rows)
+    # Ensure KPI columns exist (defensive)
+    for c in ["T50", "T80", "AUC"]:
+        if c not in df_s5.columns:
+            df_s5[c] = 0.0
+
+    df_main_raw = df_s5[["tract_id", "scenario", "T50", "T80", "AUC"]].copy()
 
     # ---------------------------------------------------------
-    # B. Resistance Metrics (from Stage 2)
+    # B. Initial Supply (from Stage 1 MC) - single scenario
     # ---------------------------------------------------------
-    prob_frames = []
-    for scen in cfg.SCENARIOS:
-        prob_file = out_dirs["STAGE1_DIR"] / f"MC_TractOutage_Prob_{scen}.csv"
-        if not prob_file.exists():
-            continue
+    supply_file = out_dirs["STAGE1_DIR"] / f"MC_Tract_Supply_{target_scen}.csv"
+    if supply_file.exists():
+        df_s = pd.read_csv(supply_file)
+        col_id = "tract" if "tract" in df_s.columns else df_s.columns[0]
+        col_val = "supply" if "supply" in df_s.columns else df_s.columns[-1]
+        df_s[col_id] = df_s[col_id].astype(str).str.split(".").str[0].str.strip()
+        df_s = df_s.rename(columns={col_id: "tract_id", col_val: "Init_Supply"})
+        df_s["scenario"] = target_scen
+        df_s = df_s.copy()
 
-        df_p = pd.read_csv(prob_file)
-        col_id = "tract" if "tract" in df_p.columns else df_p.columns[0]
-        col_val = "outage_prob" if "outage_prob" in df_p.columns else df_p.columns[-1]
-
-        df_p[col_id] = df_p[col_id].astype(str).str.split(".").str[0]
-        df_p = df_p.rename(columns={col_id: "tract_id", col_val: "Init_Prob"})
-        df_p["scenario"] = scen
-        prob_frames.append(df_p[["tract_id", "scenario", "Init_Prob"]])
-
-    if prob_frames:
         df_main_raw = (
             pd.merge(
                 df_main_raw,
-                pd.concat(prob_frames),
+                df_s[["tract_id", "scenario", "Init_Supply"]],
                 on=["tract_id", "scenario"],
                 how="left",
             )
             .fillna(0)
         )
     else:
-        df_main_raw["Init_Prob"] = 0
+        df_main_raw["Init_Supply"] = 0.0
 
     # ---------------------------------------------------------
-    # Aggregation across scenarios (mean)
+    # Aggregation (keep mean for safety; single-scenario -> identity)
     # ---------------------------------------------------------
-    logger.info("Aggregating metrics across scenarios (taking mean)...")
     df_main = (
-        df_main_raw.groupby("tract_id")[["T50", "T80", "AUC", "Init_Prob"]]
+        df_main_raw.groupby("tract_id")[["T50", "T80", "AUC", "Init_Supply"]]
         .mean()
         .reset_index()
     )
 
-    # Standardize tract_id: keep digits only, remove decimal suffix, strip leading zeros
+    # Standardize tract_id: keep digits only, drop decimal suffix, strip leading zeros
     df_main["tract_id"] = _normalize_tract_id(df_main["tract_id"])
 
     # ---------------------------------------------------------
@@ -2958,10 +3284,7 @@ def run_stage_7(
     df_main["Grid_Centrality"] = 0.0
     df_main["Grid_ImpactLambda2"] = 0.0
     df_main["Grid_Betweenness"] = 0.0
-    df_main["N_subs"] = 0
     df_main["Redundancy_HHI"] = np.nan
-    df_main["Redundancy_MaxShare"] = np.nan
-    df_main["Dist_to_CrewYard_km"] = np.nan
 
     if cent_path.exists() and mapping_df is not None:
         try:
@@ -3039,13 +3362,7 @@ def run_stage_7(
                     df_main["tract_id"].map(grid_bet).fillna(0.0)
                 )
 
-            # 4) N_subs
-            tract_nsubs = g["substation_id"].nunique()
-            df_main["N_subs"] = (
-                df_main["tract_id"].map(tract_nsubs).fillna(0).astype(int)
-            )
-
-            # 5) Redundancy metrics (if weights exist)
+            # 4) Redundancy metrics (if weights exist)
             if "weight" in m.columns:
 
                 def _redundancy_stats(grp):
@@ -3055,97 +3372,20 @@ def run_stage_7(
                         return pd.Series(
                             {
                                 "Redundancy_HHI": np.nan,
-                                "Redundancy_MaxShare": np.nan,
                             }
                         )
                     shares = w / total
                     return pd.Series(
                         {
                             "Redundancy_HHI": float(np.sum(shares**2)),
-                            "Redundancy_MaxShare": float(np.max(shares)),
                         }
                     )
 
-                red_df = g.apply(_redundancy_stats)
+                red_df = g.apply(_redundancy_stats, include_groups = False)
                 red_df.index = red_df.index.astype(str)
 
                 df_main["Redundancy_HHI"] = df_main["tract_id"].map(
                     red_df["Redundancy_HHI"]
-                )
-                df_main["Redundancy_MaxShare"] = df_main["tract_id"].map(
-                    red_df["Redundancy_MaxShare"]
-                )
-
-            # 6) Dist_to_CrewYard_km (nearest crew yard) — USE TRACT GEOMETRY CENTROID
-            if getattr(cfg, "CREW_BASES", None) and os.path.exists(cfg.LA_TRACTS_PATH):
-
-                def haversine_km(lat1, lon1, lat2, lon2):
-                    R = 6371.0  # km
-                    phi1 = math.radians(lat1)
-                    phi2 = math.radians(lat2)
-                    dphi = math.radians(lat2 - lat1)
-                    dlambda = math.radians(lon2 - lon1)
-                    a = (
-                        math.sin(dphi / 2) ** 2
-                        + math.cos(phi1)
-                        * math.cos(phi2)
-                        * math.sin(dlambda / 2) ** 2
-                    )
-                    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-                    return R * c
-
-                # Load tract geometries
-                tracts = gpd.read_file(cfg.LA_TRACTS_PATH)
-
-                # Find a tract id column
-                cand_cols = ["tract_id", "GEOID", "GEOID10", "TRACTFIPS", "FIPS"]
-                tid_col = next((c for c in cand_cols if c in tracts.columns), None)
-                if tid_col is None:
-                    for c in tracts.columns:
-                        if "geoid" in c.lower():
-                            tid_col = c
-                            break
-                if tid_col is None:
-                    tid_col = tracts.columns[0]
-
-                # Normalize tract ids to match df_main
-                tracts[tid_col] = _normalize_tract_id(tracts[tid_col])
-
-                # Ensure CRS, then compute centroid in a projected CRS
-                if tracts.crs is None:
-                    tracts = tracts.set_crs("EPSG:4326", allow_override=True)
-
-                tracts_proj = tracts.to_crs(epsg=3310)  # California Albers
-                cent_proj = tracts_proj.geometry.centroid
-                cent_wgs = gpd.GeoSeries(cent_proj, crs=tracts_proj.crs).to_crs(
-                    epsg=4326
-                )
-
-                tracts["cent_lat"] = cent_wgs.y
-                tracts["cent_lon"] = cent_wgs.x
-
-                tract_xy = (
-                    tracts[[tid_col, "cent_lat", "cent_lon"]]
-                    .dropna()
-                    .drop_duplicates(subset=[tid_col])
-                    .set_index(tid_col)
-                )
-
-                yard_coords = [(lat, lon) for _, lat, lon in cfg.CREW_BASES]
-
-                def _min_dist_cent(row):
-                    lat_t, lon_t = row["cent_lat"], row["cent_lon"]
-                    if pd.isna(lat_t) or pd.isna(lon_t):
-                        return np.nan
-                    if not yard_coords:
-                        return np.nan
-                    return float(
-                        min(haversine_km(lat_t, lon_t, ylat, ylon) for (ylat, ylon) in yard_coords)
-                    )
-
-                tract_xy["Dist_to_CrewYard_km"] = tract_xy.apply(_min_dist_cent, axis=1)
-                df_main["Dist_to_CrewYard_km"] = df_main["tract_id"].map(
-                    tract_xy["Dist_to_CrewYard_km"]
                 )
 
         except Exception as e:
@@ -3154,7 +3394,7 @@ def run_stage_7(
     # ---------------------------------------------------------
     # D. SVI & Population Density (External Census Data, 4 themes)
     # ---------------------------------------------------------
-    SVI_FILE_PATH = r"C:\2025-2026 Fall\Network science\Project\California.csv"
+    SVI_FILE_PATH = cfg.STAGE7_SVI_DATA_PATH
     svi_factor_cols = []  # up to four theme factors: SVI_THEME1-4
 
     if os.path.exists(SVI_FILE_PATH):
@@ -3291,10 +3531,7 @@ def run_stage_7(
     # ---------------------------------------------------------
     # E. NRI: multi-hazard risk & resilience (tract-level)
     # ---------------------------------------------------------
-    NRI_FILE_PATH = (
-        r"C:\2025-2026 Fall\Network science\Project\NRI_Table_CensusTracts_California"
-        r"\NRI_Table_CensusTracts_California.csv"
-    )
+    NRI_FILE_PATH = cfg.STAGE7_NRI_DATA_PATH
 
     if os.path.exists(NRI_FILE_PATH):
         logger.info(f"Loading NRI tract table from {NRI_FILE_PATH}")
@@ -3382,10 +3619,7 @@ def run_stage_7(
     # ---------------------------------------------------------
     # F. Housing Age (External ACS Data)
     # ---------------------------------------------------------
-    HOUSING_FILE_PATH = (
-        r"C:\2025-2026 Fall\Network science\Project\ACSDT5Y2022.B25034_2025-11-19T135920"
-        r"\ACSDT5Y2022.B25034-Data.csv"
-    )
+    HOUSING_FILE_PATH = cfg.STAGE7_HOUSING_DATA_PATH
 
     if os.path.exists(HOUSING_FILE_PATH):
         try:
@@ -3434,13 +3668,11 @@ def run_stage_7(
     feat_cols = [
         "T80",
         "AUC",
-        "Init_Prob",
+        "Init_Supply",
         "Grid_Centrality",
         "Grid_ImpactLambda2",
         "Grid_Betweenness",
-        "N_subs",
         "Redundancy_HHI",
-        "Dist_to_CrewYard_km",
         "Pre_1970_Ratio",
         "Pop_Density",
         "NRI_RISK_SCORE",
@@ -3455,9 +3687,7 @@ def run_stage_7(
     X = df_main[valid_cols].values
     X_scaled = StandardScaler().fit_transform(X)
 
-    # ---------------------------------------------------------
     # 2.1 Full PCA (Eigenvalues & Scree Plot)
-    # ---------------------------------------------------------
     pca = PCA()
     X_pca_full = pca.fit_transform(X_scaled)
 
@@ -3474,9 +3704,7 @@ def run_stage_7(
         }
     ).to_csv(out_dir / "pca_stats_with_eigenvalues.csv", index=False)
 
-    # =========================================================
     # 2.2 Select n_components (Automatic Kaiser Criterion)
-    # =========================================================
     eigenvalues = pca.explained_variance_
     n_components_auto = np.sum(eigenvalues > 1)
     n_components = max(2, n_components_auto)
@@ -3509,23 +3737,49 @@ def run_stage_7(
     plt.close()
     logger.info("Saved pca_scree_plot.png")
 
-    # =========================================================
-    # K-Means Clustering (Elbow Method)
-    # =========================================================
+    # 2.3 K-Means Clustering (Elbow + Silhouette)
+    from sklearn.metrics import silhouette_score
+
+    Ks = list(range(1, 11))
     iners = []
-    for k in range(1, 11):
+    sils = []  # silhouette (None for k=1)
+
+    for k in Ks:
         km = KMeans(n_clusters=k, random_state=cfg.RNG_SEED, n_init=10)
-        km.fit(X_pca)
+        labels = km.fit_predict(X_pca)
         iners.append(km.inertia_)
 
+        if k >= 2:
+            # silhouette needs at least 2 clusters
+            sils.append(silhouette_score(X_pca, labels))
+        else:
+            sils.append(np.nan)
+
     # Elbow detection (distance to line between endpoints)
-    p1, p2 = np.array([1, iners[0]]), np.array([10, iners[-1]])
+    p1, p2 = np.array([Ks[0], iners[0]]), np.array([Ks[-1], iners[-1]])
     dists = [
-        np.abs(np.cross(p2 - p1, p1 - np.array([k, iners[k - 1]]))) / np.linalg.norm(p2 - p1)
-        for k in range(1, 11)
+        np.abs(np.cross(p2 - p1, p1 - np.array([k, iners[k - Ks[0]]]))) / np.linalg.norm(p2 - p1)
+        for k in Ks
     ]
-    best_k = int(np.argmax(dists) + 1)
-    logger.info(f" > Auto-detected Best k (Clusters) = {best_k}")
+    elbow_k = int(np.argmax(dists) + Ks[0])
+
+    # Silhouette best-k (k >= 2)
+    sil_ks = [k for k in Ks if k >= 2 and np.isfinite(sils[k - Ks[0]])]
+    if sil_ks:
+        sil_best_k = int(sil_ks[int(np.argmax([sils[k - Ks[0]] for k in sil_ks]))])
+    else:
+        sil_best_k = elbow_k  # fallback
+
+    # Combine rule: prefer silhouette, but keep elbow as sanity check
+    best_k = int(elbow_k)
+
+    logger.info(f" > Elbow best k = {elbow_k}")
+    logger.info(f" > Silhouette best k = {sil_best_k} (max silhouette = {sils[sil_best_k - Ks[0]]:.4f})")
+    logger.info(f" > Selected Best k (Clusters) = {best_k}")
+
+    # Optional: save a small CSV for debugging/record
+    df_kdiag = pd.DataFrame({"k": Ks, "inertia": iners, "silhouette": sils})
+    df_kdiag.to_csv(out_dir / "kmeans_k_diagnostics.csv", index=False)
 
     # Final clustering
     kmeans = KMeans(n_clusters=best_k, random_state=cfg.RNG_SEED, n_init=10)
@@ -3543,14 +3797,11 @@ def run_stage_7(
         "T50",
         "T80",
         "AUC",
-        "Init_Prob",
+        "Init_Supply",
         "Grid_Centrality",
         "Grid_ImpactLambda2",
         "Grid_Betweenness",
-        "N_subs",
         "Redundancy_HHI",
-        "Redundancy_MaxShare",
-        "Dist_to_CrewYard_km",
         "Pre_1970_Ratio",
         "Pop_Density",
         "SVI_THEME1",
@@ -3571,8 +3822,6 @@ def run_stage_7(
     # 3. Visualization
     # =========================================================
     try:
-        import seaborn as sns
-
         # Elbow plot
         plt.figure(figsize=(8, 6))
         plt.plot(range(1, 11), iners, "bo-")
@@ -3604,6 +3853,28 @@ def run_stage_7(
             plt.savefig(out_dir / "pca_kmeans_scatter.png", dpi=300)
             plt.close()
             logger.info("Saved pca_kmeans_scatter.png")
+
+        # 3D scatter (PC1 vs PC2 vs PC3)
+        if n_components >= 3:
+            from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+            fig = plt.figure(figsize=(10, 8))
+            ax = fig.add_subplot(111, projection="3d")
+
+            for cl in sorted(df_main["cluster"].dropna().unique()):
+                sub = df_main[df_main["cluster"] == cl]
+                ax.scatter(sub["PC1"], sub["PC2"], sub["PC3"], s=18, alpha=0.6, label=f"{cl}")
+
+            ax.set_title(f"3D PCA Scatter (k={best_k})")
+            ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%})")
+            ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%})")
+            ax.set_zlabel(f"PC3 ({pca.explained_variance_ratio_[2]:.1%})")
+            ax.legend(title="cluster", loc="best")
+            plt.tight_layout()
+            plt.savefig(out_dir / "pca_kmeans_scatter_3d.png", dpi=300)
+            plt.close()
+            logger.info("Saved pca_kmeans_scatter_3d.png")
+
     except Exception as e:
         logger.warning(f"Plotting failed: {e}")
 
@@ -3675,7 +3946,6 @@ def main() -> None:
             cfg,
             stage_3_data,
             stage_0_data,
-            stage_2_data,
             stage_2_data,
             out_dirs,
         )

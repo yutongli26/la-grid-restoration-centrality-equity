@@ -40,7 +40,7 @@ class Paths:
     # --------------------
     # Input paths (Data/)
     # --------------------
-    DEVICES_CSV: str = str(DATA_DIR / "LA_Substations_WithFragility_UPDATED_CEC.csv")
+    DEVICES_CSV: str = str(DATA_DIR / "Los_Angeles_City_SUBSTATION_with_fragility_ORIGINAL.csv")
     LA_TRACTS_SHP: str = str(DATA_DIR / "LA_Tracts_With_Population.shp")
     TRANSMISSION_LINES_SHP: str = str(DATA_DIR / "TransmissionLine_CEC.shp")
     CITY_TRACTS_LIST_CSV: str = str(DATA_DIR / "Tracts_Within_Los_Angeles.csv")
@@ -57,9 +57,9 @@ class Paths:
     # Core parameters
     # --------------------
     BBOX_PAD_KM: float = 50.0
-    LINE_SNAP_TOLERANCE_M: float = 100 # Strong snapping tolerance (meters)
+    LINE_SNAP_TOLERANCE_M: float = 65 # Strong snapping tolerance (meters)
     MAX_LINE_ENDPOINT_DIST_KM: float = 0.5
-    LINE_SPLIT_TOLERANCE_M: float = 50.0  # Line split tolerance at substation points (meters)
+    LINE_SPLIT_TOLERANCE_M: float = 50  # Line split tolerance at substation points (meters)
 
 PATHS = Paths()
 
@@ -125,10 +125,10 @@ def load_substations(devices_csv: str) -> gpd.GeoDataFrame:
     df["id"] = df["id"].astype(str).str.strip()
 
     # Coordinate normalization
-    if "lon" not in df.columns and "Lon" in df.columns:
-        df = df.rename(columns={"Lon": "lon"})
-    if "lat" not in df.columns and "Lat" in df.columns:
-        df = df.rename(columns={"Lat": "lat"})
+    if "lon" not in df.columns and "LONGITUDE" in df.columns:
+        df = df.rename(columns={"LONGITUDE": "lon"})
+    if "lat" not in df.columns and "LATITUDE" in df.columns:
+        df = df.rename(columns={"LATITUDE": "lat"})
 
     for col in ["lat", "lon"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -754,7 +754,7 @@ def visualize_topology(
 # Global IDW parameters
 IDW_POWER: float = 2.0         # w ~ 1 / d^p (default p=1)
 MIN_DIST: float = 1e-3          # avoid division by zero when d == 0
-MIN_EFFECTIVE_WEIGHT: float = 0.01
+MIN_EFFECTIVE_WEIGHT: float = 0.13
 
 
 def build_W_matrix(
@@ -894,125 +894,181 @@ def apply_min_weight_threshold(
 
 def export_mapping_from_W(W, tracts_gdf, subs_gdf, out_csv):
     """
-    Export tract-to-substation mapping table from W.
-
-    Logic (unchanged):
-      1) Export all (tract_id, substation_id, weight) entries where weight > 1e-6.
-      2) Ensure every substation appears at least once; if missing, inject a tiny weight (1e-3)
-         by assigning that substation to the nearest tract (by centroid distance).
-      3) Append tract population if available.
-      4) Append substation lat/lon.
-      5) Write a single CSV to out_csv.
+    Export tract-to-substation mapping table with "Smart Injection".
+    
+    [SMART LOGIC SUMMARY]
+    1. Voltage Filter: High Voltage (>200kV) -> Weight 0.001 (Ignore).
+       Reason: Transmission hubs do not serve neighborhoods directly.
+       
+    2. Distance Weighting: For Low Voltage (<200kV) Islands:
+       - Logic: If an island substation is closer to the tract than the main grid,
+         it likely provides a significant portion of power.
+       - Formula: Weight = (Dist_Main / Dist_Island)^2
+       
+    3. Safety Clamp: Limit weight to [0.1, 5.0] to prevent mathematical explosion
+       due to GIS coordinate overlaps.
     """
     if W.empty:
         return
 
+    # Constants
     WEIGHT_EXPORT_EPS = 1e-6
-    INJECT_EPS_WEIGHT = 1e-3
+    VOLTAGE_THRESHOLD = 200.0 
+    MIN_CLAMP = 0.1
+    MAX_CLAMP = 5.0
 
     # ---------------------------------------------------------------------
-    # 1) Export non-trivial weights from W (original threshold: > 1e-6)
+    # 1. Prepare Data (Voltage Map & Spatial Index)
+    # ---------------------------------------------------------------------
+    # Create Voltage Map for fast lookup (Substation ID -> Voltage)
+    if "MAX_VOLT" in subs_gdf.columns:
+        volt_map = dict(zip(subs_gdf["id"].astype(str).str.strip(), 
+                            subs_gdf["MAX_VOLT"].fillna(0.0)))
+    else:
+        logging.warning("MAX_VOLT missing! Defaulting to Low Voltage logic for all islands.")
+        volt_map = {}
+    
+    # Prepare Geometry (Project to consistent CRS if needed)
+    main_tree = None
+    tract_centroids = None
+    tract_ids_list = []
+    
+    if not tracts_gdf.empty:
+        # Ensure CRS consistency
+        tracts_proj = tracts_gdf
+        try:
+            if subs_gdf.crs != tracts_proj.crs:
+                subs_proj = subs_gdf.to_crs(tracts_proj.crs)
+            else:
+                subs_proj = subs_gdf
+        except Exception:
+            # Fallback if CRS is missing, assume matching
+            subs_proj = subs_gdf
+            
+        tract_centroids = tracts_proj.geometry.centroid
+        tract_ids_list = tracts_proj["tract_id"].astype(str).tolist()
+        
+        # Build KDTree for the "Main Grid" (Substations already in W)
+        # This allows us to quickly calculate 'd_Main' (distance to valid grid)
+        connected_sub_ids = W.columns.astype(str).tolist()
+        connected_subs_gdf = subs_proj[subs_proj["id"].astype(str).isin(connected_sub_ids)]
+        
+        if not connected_subs_gdf.empty:
+            main_coords = list(zip(connected_subs_gdf.geometry.x, connected_subs_gdf.geometry.y))
+            # Import locally to be safe if missing at top level
+            from scipy.spatial import cKDTree
+            main_tree = cKDTree(main_coords)
+
+    # ---------------------------------------------------------------------
+    # 2. Export Existing Connections (The Main Grid)
     # ---------------------------------------------------------------------
     records = []
+    # Iterate through the sparse W matrix
     for tid, row in W.iterrows():
+        # Only take non-zero weights
         nz = row[row > WEIGHT_EXPORT_EPS]
         for sid, w in nz.items():
-            records.append(
-                {
-                    "tract_id": str(tid),
-                    "substation_id": str(sid),
-                    "weight": float(w),
-                }
-            )
+            records.append({
+                "tract_id": str(tid),
+                "substation_id": str(sid),
+                "weight": float(w),
+            })
 
     df = pd.DataFrame(records)
 
     # ---------------------------------------------------------------------
-    # 2) Ensure each substation appears at least once
+    # 3. Smart Injection of Missing Islands
     # ---------------------------------------------------------------------
-    all_sub_ids = subs_gdf["id"].astype(str).tolist()
+    all_sub_ids = subs_gdf["id"].astype(str).str.strip().tolist()
 
     if df.empty:
         used_sub_ids = set()
     else:
-        df["substation_id"] = df["substation_id"].astype(str)
-        df["tract_id"] = df["tract_id"].astype(str)
+        # Standardize IDs to string for comparison
+        df["substation_id"] = df["substation_id"].astype(str).str.strip()
+        df["tract_id"] = df["tract_id"].astype(str).str.strip()
         used_sub_ids = set(df["substation_id"].tolist())
 
+    # Identify Substations missing from the W matrix (Islands)
     missing_subs = [sid for sid in all_sub_ids if sid not in used_sub_ids]
 
-    if missing_subs:
-        logging.warning(
-            f"{len(missing_subs)} substations have no non-zero weights in W. "
-            f"Injecting minimal weights so each appears at least once."
-        )
+    if missing_subs and not tracts_gdf.empty:
+        logging.info(f"--- Smart Injection: Processing {len(missing_subs)} isolated substations ---")
 
-        if tracts_gdf.empty:
-            logging.warning(
-                "Tracts GeoDataFrame is empty; cannot attach missing substations to nearest tracts."
-            )
-        else:
-            # Use tract CRS for nearest-tract lookup (keep original behavior)
-            tracts_proj = tracts_gdf
-            try:
-                subs_proj = subs_gdf.to_crs(tracts_proj.crs) if subs_gdf.crs != tracts_proj.crs else subs_gdf
-            except Exception:
-                # Defensive fallback if CRS metadata is problematic
-                subs_proj = subs_gdf.to_crs(tracts_proj.crs)
+        injected_rows = []
+        for sid in missing_subs:
+            sub_row = subs_proj[subs_proj["id"].astype(str).str.strip() == sid]
+            if sub_row.empty: continue
+            
+            # --- Geometry Calculations ---
+            sub_pt = sub_row.geometry.iloc[0]
+            
+            # A. Find Nearest Tract (Target for Injection) & Distance (d_Island)
+            dists_to_tracts = tract_centroids.distance(sub_pt).values
+            nearest_idx = int(np.argmin(dists_to_tracts))
+            
+            target_tid = tract_ids_list[nearest_idx]
+            d_Island = dists_to_tracts[nearest_idx]
+            
+            # B. Find Distance to Main Grid (d_Main)
+            # Distance from that Tract's centroid to the nearest connected Main Grid node
+            if main_tree:
+                centroid_pt = tract_centroids.iloc[nearest_idx]
+                d_Main, _ = main_tree.query((centroid_pt.x, centroid_pt.y), k=1)
+            else:
+                d_Main = d_Island # Fallback if no main grid exists
 
-            centroids = tracts_proj.geometry.centroid
-            tract_ids_list = tracts_proj["tract_id"].astype(str).tolist()
+            # Avoid division by zero
+            d_Island = max(d_Island, 1e-3)
+            d_Main = max(d_Main, 1e-3)
 
-            injected_rows = []
-            for sid in missing_subs:
-                sub_row = subs_proj[subs_proj["id"].astype(str) == sid]
-                if sub_row.empty:
-                    logging.warning(
-                        f"Substation {sid} not found in subs_gdf; skip injecting mapping for it."
-                    )
-                    continue
+            # --- Weight Logic ---
+            voltage = volt_map.get(sid, 0.0)
+            
+            if voltage >= VOLTAGE_THRESHOLD:
+                # Rule 1: High Voltage Island -> Ignore
+                # It is a transmission node, not suitable for direct supply injection.
+                final_weight = 0.001
+                logging.info(f"   -> [HV Ignored] Sub {sid} ({voltage}kV)")
+            else:
+                # Rule 2: Low Voltage Island -> Relative Importance Ratio
+                # If Island is closer than Main Grid, weight > 1.0
+                raw_weight = (d_Main / d_Island) ** 2
+                
+                # Rule 3: Clamp to valid range [0.1, 5.0]
+                final_weight = min(MAX_CLAMP, max(MIN_CLAMP, raw_weight))
+                
+                logging.info(f"   -> [LV Injected] Sub {sid}: d_Iso={d_Island:.0f}m / d_Main={d_Main:.0f}m "
+                              f"-> Ratio={raw_weight:.2f} -> Clamped={final_weight:.2f}")
 
-                sub_pt = sub_row.geometry.iloc[0]
-                dists = centroids.distance(sub_pt).values
-                nearest_idx = int(np.argmin(dists))
-                tid = tract_ids_list[nearest_idx]
+            injected_rows.append({
+                "tract_id": str(target_tid),
+                "substation_id": str(sid),
+                "weight": float(final_weight),
+            })
 
-                injected_rows.append(
-                    {
-                        "tract_id": str(tid),
-                        "substation_id": str(sid),
-                        "weight": float(INJECT_EPS_WEIGHT),
-                    }
-                )
-
-            if injected_rows:
-                df = pd.concat([df, pd.DataFrame(injected_rows)], ignore_index=True)
+        if injected_rows:
+            df = pd.concat([df, pd.DataFrame(injected_rows)], ignore_index=True)
+            logging.info(f"--- Smart Injection Complete: Added {len(injected_rows)} connections ---")
 
     # ---------------------------------------------------------------------
-    # 3) Append population (if available)
+    # 4. Post-Processing (Add Metadata)
     # ---------------------------------------------------------------------
-    pop_col = next(
-        (c for c in ["population", "POPULATION", "E_TOTPOP", "totpop"] if c in tracts_gdf.columns),
-        None,
-    )
-
+    # Map Population
+    pop_col = next((c for c in ["population", "POPULATION", "E_TOTPOP", "totpop"] if c in tracts_gdf.columns), None)
     if pop_col:
         pop_map = tracts_gdf.set_index("tract_id")[pop_col].to_dict()
         df["population"] = df["tract_id"].map(pop_map).fillna(0).astype(int)
     else:
         df["population"] = 0
 
-    # ---------------------------------------------------------------------
-    # 4) Append substation lat/lon
-    # ---------------------------------------------------------------------
+    # Map Coordinates (Lat/Lon)
     lat_map = subs_gdf.set_index("id")["lat"].to_dict()
     lon_map = subs_gdf.set_index("id")["lon"].to_dict()
     df["lat"] = df["substation_id"].map(lat_map)
     df["lon"] = df["substation_id"].map(lon_map)
 
-    # ---------------------------------------------------------------------
-    # 5) Single CSV write (only once)
-    # ---------------------------------------------------------------------
+    # Save to CSV
     df.to_csv(out_csv, index=False)
     logging.info(f"Mapping saved to {out_csv}")
 
