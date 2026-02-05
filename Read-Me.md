@@ -45,7 +45,7 @@ The pipeline supports both an **unconstrained baseline** and a **logistics-aware
 4. Propagate substation disruption to tract-level service using a tract–substation mapping matrix (W), and generate spatial impact maps.
 5. Simulate restoration under:
    - an unconstrained baseline; and
-   - a logistics-aware setting (e.g., 135 crews from 7 bases with travel-time constraints).
+   - a logistics-aware setting (e.g., 29 crews from 7 bases with travel-time constraints).
 6. Compare prioritization strategies (e.g., Random, Centrality-first, Population-impact-first, Hospital-first) using service restoration metrics and connectivity-based robustness metrics (e.g., LCC).
 7. Classify census tracts into resilience typologies using PCA + K-means with simulated recovery metrics and socioeconomic indicators.
 
