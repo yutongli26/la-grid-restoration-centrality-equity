@@ -31,8 +31,8 @@ The pipeline supports both an **unconstrained baseline** and a **logistics-aware
 ## Repository structure
 
 - `Topology_and_Weight.py` — Build transmission topology and tract–substation mapping matrix (W)
-- `IDW.py` — PGA interpolation (IDW) utilities (if needed)
-- `build_travel_matrices_osm.py` — Travel-time matrices from road network (OSM-based, optional)
+- `IDW.py` — PGA interpolation (IDW) utilities
+- `build_travel_matrices_osm.py` — Travel-time matrices from road network (OSM-based)
 - `C257H_Project_Main.py` — Main pipeline (simulation + restoration + KPIs + typology)
 - `Project_Visualizer.py` — Mapping and figure generation
 
