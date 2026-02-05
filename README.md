@@ -73,11 +73,16 @@ The pipeline supports both an **unconstrained baseline** and a **logistics-aware
 This repository expects external datasets, all of which included in the "data" folder.
 
 - OpenStreetMap contributors (Open Database License): <https://www.openstreetmap.org/>
-- California Energy Commission GIS Data (transmission lines): <https://gis.data.ca.gov/>
-- USGS ShakeMap (Peak Ground Acceleration): <https://earthquake.usgs.gov/data/shakemap/>
+- California Energy Commission GIS Data (transmission lines): <https://gis.data.ca.gov/datasets/CAEnergy::california-electric-transmission-lines-1/about>
+- California Energy Commission GIS Data (electric substations): <https://hub.arcgis.com/datasets/c2d4e65fe7b84c67a94e98ff9555c3ac_0>
+- California Geological Survey Map Sheet 48 (2% in 50 years probabilistic ground motion; source for the "2pc50" scenario): <https://www.conservation.ca.gov/cgs/publications/ms48>
+- USGS ShakeMap (Peak Ground Acceleration, source for the other scenarios): <https://earthquake.usgs.gov/data/shakemap/>
+- FEMA National Risk Index (NRI): <https://www.fema.gov/flood-maps/products-tools/national-risk-index>
 - US Census TIGER/Line (tract boundaries): <https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html>
 - US Census ACS 5-year estimates: <https://api.census.gov/data.html>
 - CDC/ATSDR Social Vulnerability Index (SVI): <https://www.atsdr.cdc.gov/place-health/php/svi/index.html>
+- HIFLD Electric Substations (ID crosswalk / supplemental attributes): <https://catalog.data.gov/dataset/electric-substations>
+- City of Los Angeles GeoHub (city boundary layer): <https://geohub.lacity.org/maps/city-boundary>
 
 ---
 
@@ -85,11 +90,15 @@ This repository expects external datasets, all of which included in the "data" f
 
 Depending on enabled stages, the pipeline can export:
 
-- Substation-level damage-state probabilities and recovery trajectories
-- Tract-level service/outage and recovery trajectories
-- Strategy-level KPI tables (system / population-weighted / equity-weighted)
-- Maps and summary plots
-- PCA loadings, clustering labels, and tract typology summaries
+- Substation-level hazard/intensity sampling outputs (e.g., PGA assigned per substation per scenario)
+- Substation-level damage-state probabilities (MC) and recovery trajectories
+- Tract-level service/outage probabilities and recovery trajectories (via tract–substation mapping W)
+- Network robustness / topology metrics and comparative curves across strategies
+- Stage 4 logistics artifacts: travel-time matrices (base→task, task→task) and derived heatmaps
+- Strategy-level KPI tables (system / population-weighted / equity-weighted), plus efficiency summaries (e.g., T50/T80/AUC)
+- Scheduling artifacts: rule-based schedules and Gantt chart inputs/plots (Stage 4), GA schedule CSVs and Gantt plots (Stage 5)
+- PCA & clustering outputs: PCA stats/loadings/scree plots, k-means diagnostics, final cluster labels, and tract typology summaries
+- Maps and publication-quality figures generated from Stage outputs (recovery curves, KPI comparisons, clusters)
 
 ---
 
