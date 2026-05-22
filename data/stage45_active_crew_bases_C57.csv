@@ -1,0 +1,12 @@
+yard_id,utility,facility,integer_crews,fractional_crews,raw_visual_weight,latitude,longitude,scenario_label,allocation_label,travel_matrix_origin_key
+D01,LADWP,LADWP Substations Regional Center,1,1.446154,2.0,34.04002552042754,-118.2357973,C57_substation_ratio_main,C57_yard_allocation_no_deletion_tie_coherent_zero_low,D01
+D02,LADWP,LADWP Central District HQ,11,10.846154,15.0,34.050723048488216,-118.2361221,C57_substation_ratio_main,C57_yard_allocation_no_deletion_tie_coherent_zero_low,D02
+D03,LADWP,LADWP Boylston Facility,1,0.723077,1.0,34.059497783218525,-118.2559702,C57_substation_ratio_main,C57_yard_allocation_no_deletion_tie_coherent_zero_low,D03
+D04,LADWP,LADWP Valley Center,22,21.692308,30.0,34.209341635787055,-118.4451115,C57_substation_ratio_main,C57_yard_allocation_no_deletion_tie_coherent_zero_low,D04
+D05,LADWP,LADWP Central Service Center,1,1.446154,2.0,34.03298008205709,-118.2575036,C57_substation_ratio_main,C57_yard_allocation_no_deletion_tie_coherent_zero_low,D05
+D06,LADWP,LADWP Main Street Facility,11,10.846154,15.0,34.066584450527095,-118.2275349,C57_substation_ratio_main,C57_yard_allocation_no_deletion_tie_coherent_zero_low,D06
+D07,SCE,SCE Dominguez Hills Service Center,3,2.173913,5.0,33.85547518471537,-118.2337299,C57_substation_ratio_main,C57_yard_allocation_no_deletion_tie_coherent_zero_low,D07
+D09,SCE,SCE Alhambra Combined Facility,3,2.608696,6.0,34.08431348271525,-118.1421584,C57_substation_ratio_main,C57_yard_allocation_no_deletion_tie_coherent_zero_low,D09
+D10,SCE,SCE Santa Monica Service Center,1,0.869565,2.0,34.026105913440354,-118.4723723,C57_substation_ratio_main,C57_yard_allocation_no_deletion_tie_coherent_zero_low,D10
+D12,SCE,SCE Whittier Service Center / SCE-Whittier Santa Fe Springs location,2,1.304348,3.0,33.94971980238355,-118.0704717,C57_substation_ratio_main,C57_yard_allocation_no_deletion_tie_coherent_zero_low,D12
+D13,SCE,SCE South Bay Service Center,1,0.869565,2.0,33.84588987293782,-118.3274784,C57_substation_ratio_main,C57_yard_allocation_no_deletion_tie_coherent_zero_low,D13

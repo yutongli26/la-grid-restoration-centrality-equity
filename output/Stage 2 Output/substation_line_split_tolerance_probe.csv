@@ -1,0 +1,7 @@
+tolerance_m,line_count_before,line_count_after,split_lines,cut_points,unique_substations_cut
+50,1952,1960,8,8,4
+75,1952,1967,14,15,9
+100,1952,1977,22,25,14
+150,1952,1985,27,33,17
+200,1952,1999,41,47,24
+300,1952,2015,57,63,33

@@ -17,7 +17,8 @@ Compatibility:
 
 import os
 import logging
-from typing import List, Tuple, Dict, Set, Optional
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -28,13 +29,14 @@ from pathlib import Path
 # ======================= USER CONFIGURATION =======================
 
 # --- File Paths ---
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "Data"
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
 GRAPHML_PATH = str(DATA_DIR / "la_drive.graphml")
-SUBS_CSV = str(DATA_DIR / "Los_Angeles_City_SUBSTATION_with_fragility.csv")
+SUBS_CSV = str(DATA_DIR / "Los_Angeles_City_SUBSTATION_with_fragility_29.csv")
+DEPOT_INPUT_CSV = str(DATA_DIR / "stage45_depot_inputs_final_origin_proxy.csv")
 
 # --- Output Settings ---
-OUTPUT_ROOT = str(BASE_DIR)
+OUTPUT_ROOT = str(BASE_DIR / "output")
 STAGE4_DIR = "Stage 4 Output"
 TRAVEL_BASE_TO_TASK_CSV = "travel_base_to_task.csv"
 TRAVEL_TASK_TO_TASK_CSV = "travel_task_to_task.csv"
@@ -45,21 +47,38 @@ ID_COL = "HIFLD_ID"
 LON_COL = "LONGITUDE"
 LAT_COL = "LATITUDE"
 
-# --- Crew Bases ---
-# CRITICAL: The IDs (base_0, base_1) MUST match the generation logic in the main pipeline.
-# Coordinates must match 'C257H_Project_Main.py' exactly to prevent data drift.
-CREW_BASES: List[Tuple[str, float, float]] = [
-    ("base_0", 34.2318, -118.3817),  # Valley Yard (Sun Valley)
-    ("base_1", 34.0375, -118.2555),  # Central Yard
-]
-
 # --- Calculation Parameters ---
 # Substation IDs to include (None = Process all substations in CSV)
+# Keep the travel task universe aligned with the tract-analysis baseline by
+# default, rather than the broader raw inventory.
+MAPPING_CSV = str(DATA_DIR / "tract_to_substation_mapping_CEC.csv")
 LIMIT_TO_SUB_IDS: Optional[List[str]] = None
+SUBS_COORD_FALLBACK_CSVS: Tuple[str, ...] = (
+    str(DATA_DIR / "Los_Angeles_City_SUBSTATION_with_fragility_ORIGINAL.csv"),
+    str(DATA_DIR / "Substations_PGA_IDW_CEC.csv"),
+)
 
 # Max travel time in seconds (e.g., 6 hours).
 # Dijkstra will stop searching beyond this limit to save time.
 MAX_TRAVEL_TIME_SEC = 6 * 3600.0
+
+
+@dataclass(frozen=True)
+class TravelMatrixConfig:
+    graphml_path: str = GRAPHML_PATH
+    subs_csv: str = SUBS_CSV
+    output_root: str = OUTPUT_ROOT
+    stage4_dir: str = STAGE4_DIR
+    travel_base_to_task_csv: str = TRAVEL_BASE_TO_TASK_CSV
+    travel_task_to_task_csv: str = TRAVEL_TASK_TO_TASK_CSV
+    mapping_csv: str = MAPPING_CSV
+    depot_input_csv: str = DEPOT_INPUT_CSV
+    substation_coordinate_fallback_csvs: Tuple[str, ...] = SUBS_COORD_FALLBACK_CSVS
+    limit_to_sub_ids: Optional[List[str]] = None
+    id_col: str = ID_COL
+    lon_col: str = LON_COL
+    lat_col: str = LAT_COL
+    max_travel_time_sec: float = MAX_TRAVEL_TIME_SEC
 
 
 # ======================= HELPER FUNCTIONS =======================
@@ -75,6 +94,181 @@ def setup_logging():
 def ensure_dir(path: str):
     """Ensure the output directory exists."""
     os.makedirs(path, exist_ok=True)
+
+
+def load_task_ids_from_mapping(mapping_csv: str) -> Optional[List[str]]:
+    """
+    Read the tract-to-substation mapping and return the aligned task IDs used by
+    the main analysis baseline. Falls back to None if the mapping is missing or
+    unreadable so the script can still run against the full inventory.
+    """
+    logger = logging.getLogger()
+    if not os.path.exists(mapping_csv):
+        logger.warning("Mapping CSV not found for task filtering: %s", mapping_csv)
+        return None
+
+    try:
+        mapping = pd.read_csv(mapping_csv)
+    except Exception as exc:
+        logger.warning("Failed to read mapping CSV %s: %s", mapping_csv, exc)
+        return None
+
+    if "substation_id" not in mapping.columns:
+        logger.warning("Mapping CSV missing 'substation_id': %s", mapping_csv)
+        return None
+
+    ids = (
+        mapping["substation_id"]
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+    )
+    unique_ids = sorted(ids[ids.ne("")].dropna().unique().tolist())
+    return unique_ids or None
+
+
+def standardize_substation_coordinates(csv_path: str, cfg: TravelMatrixConfig) -> pd.DataFrame:
+    """Load one substation coordinate table and return id/lon/lat columns."""
+    df = pd.read_csv(csv_path)
+    cols = list(df.columns)
+
+    if cfg.id_col in cols:
+        curr_id = cfg.id_col
+    elif "HIFLD_ID" in cols:
+        curr_id = "HIFLD_ID"
+    elif "ID" in cols:
+        curr_id = "ID"
+    elif "id" in cols:
+        curr_id = "id"
+    else:
+        raise ValueError(f"ID column not found in {csv_path}. Available: {cols}")
+
+    if cfg.lon_col in cols and cfg.lat_col in cols:
+        curr_lon, curr_lat = cfg.lon_col, cfg.lat_col
+    elif "LONGITUDE" in cols and "LATITUDE" in cols:
+        curr_lon, curr_lat = "LONGITUDE", "LATITUDE"
+    elif "lon" in cols and "lat" in cols:
+        curr_lon, curr_lat = "lon", "lat"
+    elif "lon.1" in cols and "lat.1" in cols:
+        curr_lon, curr_lat = "lon.1", "lat.1"
+    else:
+        raise ValueError(f"Coordinate columns not found in {csv_path}. Available: {cols}")
+
+    out = df[[curr_id, curr_lon, curr_lat]].copy()
+    out = out.rename(columns={curr_id: "id", curr_lon: "lon", curr_lat: "lat"})
+    out["id"] = out["id"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    out["lon"] = pd.to_numeric(out["lon"], errors="coerce")
+    out["lat"] = pd.to_numeric(out["lat"], errors="coerce")
+    out = out.dropna(subset=["id", "lon", "lat"])
+    return out.drop_duplicates("id", keep="first")
+
+
+def load_c57_crew_bases(depot_csv: str) -> List[Tuple[str, float, float]]:
+    """
+    Load active C57 repair origins from the finalized Stage 4/5 depot input.
+
+    Returns tuples in the same shape the OSM builder already expects:
+    (origin_id, latitude, longitude), with origin_id equal to D01-D16 yard IDs.
+    """
+    logger = logging.getLogger()
+    path = Path(depot_csv)
+    if not path.exists():
+        raise FileNotFoundError(f"C57 depot input not found: {path}")
+
+    df = pd.read_csv(path)
+    df = df.rename(
+        columns={
+            "yard_id": "depot_id",
+            "facility": "depot_name",
+        }
+    )
+    allocation_cols = [
+        "scenario_label",
+        "allocation_label",
+        "raw_visual_weight",
+        "fractional_crews",
+        "integer_crews",
+        "active_in_integer_input",
+    ]
+    scenario_label = "C57_substation_ratio_main"
+    allocation_label = "C57_yard_allocation_no_deletion_tie_coherent_zero_low"
+    if any(c not in df.columns for c in allocation_cols):
+        active_path = path.with_name("stage45_active_crew_bases_C57.csv")
+        if active_path.exists():
+            active_alloc = pd.read_csv(active_path).rename(
+                columns={
+                    "yard_id": "depot_id",
+                    "facility": "depot_name",
+                }
+            )
+            active_alloc["depot_id"] = active_alloc["depot_id"].astype(str).str.strip()
+            merge_cols = ["depot_id"] + [
+                c for c in allocation_cols if c not in df.columns and c in active_alloc.columns
+            ]
+            if len(merge_cols) > 1:
+                df = df.merge(active_alloc[merge_cols], on="depot_id", how="left")
+    defaults = {
+        "scenario_label": scenario_label,
+        "allocation_label": allocation_label,
+        "raw_visual_weight": 0.0,
+        "fractional_crews": 0.0,
+        "integer_crews": 0,
+        "active_in_integer_input": "no",
+    }
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
+        else:
+            df[col] = df[col].fillna(default)
+    df.loc[pd.to_numeric(df["integer_crews"], errors="coerce").fillna(0) > 0, "active_in_integer_input"] = "yes"
+
+    required = {
+        "depot_id",
+        "latitude",
+        "longitude",
+        "integer_crews",
+        "active_in_integer_input",
+        "scenario_label",
+        "allocation_label",
+    }
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"C57 depot input missing required columns: {missing}")
+
+    expected_ids = [f"D{i:02d}" for i in range(1, 17)]
+    expected_active = ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D09", "D10", "D12", "D13"]
+
+    df = df.copy()
+    df["depot_id"] = df["depot_id"].astype(str).str.strip()
+    if sorted(df["depot_id"].tolist()) != expected_ids:
+        raise ValueError("C57 depot input must contain exactly D01-D16 for travel matrix generation.")
+    if not (df["scenario_label"].astype(str).str.strip() == scenario_label).all():
+        raise ValueError("C57 depot scenario_label validation failed.")
+    if not (df["allocation_label"].astype(str).str.strip() == allocation_label).all():
+        raise ValueError("C57 depot allocation_label validation failed.")
+
+    df["integer_crews"] = pd.to_numeric(df["integer_crews"], errors="raise").astype(int)
+    if int(df["integer_crews"].sum()) != 57:
+        raise ValueError("C57 depot integer_crews total must be 57.")
+
+    active = df[df["integer_crews"] > 0].copy()
+    actual_active = sorted(active["depot_id"].tolist())
+    if actual_active != expected_active:
+        raise ValueError(f"C57 active yard set invalid: {actual_active}")
+    active_flag = df["active_in_integer_input"].astype(str).str.strip().str.lower()
+    if not (active_flag[df["integer_crews"] > 0] == "yes").all():
+        raise ValueError("C57 active depot rows must have active_in_integer_input=yes.")
+    if not (active_flag[df["integer_crews"] == 0] == "no").all():
+        raise ValueError("C57 inactive depot rows must have active_in_integer_input=no.")
+    if active[["latitude", "longitude"]].isna().any().any():
+        raise ValueError("C57 active depot coordinates must be non-null.")
+
+    bases = [
+        (str(row["depot_id"]), float(row["latitude"]), float(row["longitude"]))
+        for _, row in active.sort_values("depot_id").iterrows()
+    ]
+    logger.info("Loaded %d active C57 crew bases from %s.", len(bases), path)
+    return bases
 
 
 def nearest_nodes_compat(G, xs, ys):
@@ -136,41 +330,61 @@ def load_graph_with_travel_time(graphml_path: str) -> nx.MultiDiGraph:
     return G
 
 
-def load_substations() -> pd.DataFrame:
+def load_substations(
+    cfg: TravelMatrixConfig,
+    limit_to_sub_ids: Optional[List[str]] = None,
+) -> pd.DataFrame:
     """
     Load substation data from CSV and standardize columns to ['id', 'lon', 'lat'].
     """
     logger = logging.getLogger()
-    logger.info(f"Loading substations from {SUBS_CSV} ...")
+    logger.info(f"Loading substations from {cfg.subs_csv} ...")
 
-    df = pd.read_csv(SUBS_CSV)
-    cols = list(df.columns)
+    out = standardize_substation_coordinates(cfg.subs_csv, cfg)
 
-    # 1. Identify ID Column
-    if ID_COL in cols:
-        curr_id = ID_COL
-    elif "id" in cols:
-        curr_id = "id"
-    else:
-        raise ValueError(f"ID column not found. Expected '{ID_COL}' or 'id'. Available: {cols}")
+    # Optional filtering. If the primary inventory is missing mapped targets,
+    # fill by exact substation ID from configured coordinate fallback tables.
+    if limit_to_sub_ids is not None:
+        limit_ids = [str(s).strip().replace(".0", "") for s in limit_to_sub_ids]
+        limit_set = set(limit_ids)
+        out = out[out["id"].isin(limit_set)].copy()
 
-    # 2. Identify Coordinate Columns
-    if LON_COL in cols and LAT_COL in cols:
-        curr_lon, curr_lat = LON_COL, LAT_COL
-    elif "lon.1" in cols and "lat.1" in cols:
-        curr_lon, curr_lat = "lon.1", "lat.1"
-    else:
-        raise ValueError(f"Coordinates not found. Expected {LON_COL}/{LAT_COL}. Available: {cols}")
+        missing_ids = sorted(limit_set - set(out["id"]))
+        if missing_ids:
+            logger.warning(
+                "Primary substation file is missing %d mapped IDs; checking coordinate fallback tables.",
+                len(missing_ids),
+            )
+            fallback_rows = []
+            remaining_missing = set(missing_ids)
+            for fallback_csv in cfg.substation_coordinate_fallback_csvs:
+                if not remaining_missing:
+                    break
+                if not os.path.exists(fallback_csv):
+                    logger.warning("Substation coordinate fallback missing: %s", fallback_csv)
+                    continue
+                fallback = standardize_substation_coordinates(fallback_csv, cfg)
+                fallback = fallback[fallback["id"].isin(remaining_missing)].copy()
+                if not fallback.empty:
+                    fallback_rows.append(fallback)
+                    remaining_missing -= set(fallback["id"])
+                    logger.info(
+                        "Filled %d mapped substation coordinates from fallback: %s",
+                        len(fallback),
+                        fallback_csv,
+                    )
 
-    # 3. Standardize
-    df[curr_id] = df[curr_id].astype(str).str.strip()
-    out = df[[curr_id, curr_lon, curr_lat]].copy()
-    out = out.rename(columns={curr_id: "id", curr_lon: "lon", curr_lat: "lat"})
+            if fallback_rows:
+                out = pd.concat([out] + fallback_rows, ignore_index=True)
+                out = out.drop_duplicates("id", keep="first")
 
-    # 4. Optional Filtering
-    if LIMIT_TO_SUB_IDS is not None:
-        limit_ids = set(str(s) for s in LIMIT_TO_SUB_IDS)
-        out = out[out["id"].isin(limit_ids)].copy()
+        still_missing = sorted(limit_set - set(out["id"]))
+        if still_missing:
+            raise ValueError(
+                f"Substation coordinate inventory missing mapped IDs after fallback lookup: {still_missing}"
+            )
+
+        out = out.set_index("id").reindex(limit_ids).reset_index()
         logger.info(f"Filtered to {len(out)} substations based on user settings.")
 
     return out
@@ -199,15 +413,16 @@ def map_points_to_nodes(G, df_subs: pd.DataFrame) -> Dict[str, int]:
     return mapping
 
 
-def get_base_nodes(G) -> List[Tuple[str, int]]:
+def get_base_nodes(G, cfg: TravelMatrixConfig) -> List[Tuple[str, int]]:
     """
     Map Crew Base coordinates to nearest graph nodes.
     Returns: List of tuples [(base_id, graph_node_id)]
     """
     logger = logging.getLogger()
     base_nodes: List[Tuple[str, int]] = []
-    
-    for base_id, lat, lon in CREW_BASES:
+    crew_bases = load_c57_crew_bases(cfg.depot_input_csv)
+
+    for base_id, lat, lon in crew_bases:
         node_id = nearest_nodes_compat(G, [lon], [lat])[0]
         base_nodes.append((base_id, node_id))
         
@@ -219,6 +434,8 @@ def compute_travel_times(
     G: nx.MultiDiGraph,
     base_nodes: List[Tuple[str, int]],
     sub_to_node: Dict[str, int],
+    *,
+    max_travel_time_sec: float = MAX_TRAVEL_TIME_SEC,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Compute shortest path travel times using Dijkstra's algorithm.
@@ -242,7 +459,7 @@ def compute_travel_times(
         # Use 'cutoff' to stop searching nodes further than MAX_TRAVEL_TIME
         try:
             lengths = nx.single_source_dijkstra_path_length(
-                G, base_node, weight="travel_time", cutoff=MAX_TRAVEL_TIME_SEC
+                G, base_node, weight="travel_time", cutoff=max_travel_time_sec
             )
         except TypeError:
             # Fallback for older NetworkX versions that don't support 'cutoff'
@@ -255,7 +472,7 @@ def compute_travel_times(
             t_sec = lengths.get(node, np.nan)
             
             # Enforce cutoff manually if fallback was used
-            if t_sec is not None and t_sec > MAX_TRAVEL_TIME_SEC:
+            if t_sec is not None and t_sec > max_travel_time_sec:
                 t_sec = np.nan
                 
             base_mat_sec[i, j] = t_sec
@@ -264,7 +481,7 @@ def compute_travel_times(
     base_to_task_hr = base_mat_sec / 3600.0
     base_to_task_df = pd.DataFrame(
         base_to_task_hr,
-        index=[b[0] for b in base_nodes], # Index = base_0, base_1...
+        index=[b[0] for b in base_nodes],
         columns=sub_ids,
     )
     base_to_task_df.index.name = "base_id"
@@ -289,7 +506,7 @@ def compute_travel_times(
         
         try:
             dists = nx.single_source_dijkstra_path_length(
-                G, u_node, weight="travel_time", cutoff=MAX_TRAVEL_TIME_SEC
+                G, u_node, weight="travel_time", cutoff=max_travel_time_sec
             )
         except TypeError:
             dists = nx.single_source_dijkstra_path_length(
@@ -312,7 +529,7 @@ def compute_travel_times(
             node_d = sub_to_node[sid_d]
             t_sec = dists_from_o.get(node_d, np.nan)
             
-            if t_sec is not None and t_sec > MAX_TRAVEL_TIME_SEC:
+            if t_sec is not None and t_sec > max_travel_time_sec:
                 t_sec = np.nan
             task_mat_sec[i, j] = t_sec
 
@@ -336,17 +553,21 @@ def compute_travel_times(
     return base_to_task_df, task_df
 
 
-def save_outputs(base_to_task: pd.DataFrame, task_to_task: pd.DataFrame):
+def save_outputs(
+    base_to_task: pd.DataFrame,
+    task_to_task: pd.DataFrame,
+    cfg: TravelMatrixConfig,
+):
     """
     Save matrices to CSV in the format expected by 'C257H_Project_Main.py'.
     """
     logger = logging.getLogger()
-    stage4_path = os.path.join(OUTPUT_ROOT, STAGE4_DIR)
+    stage4_path = os.path.join(cfg.output_root, cfg.stage4_dir)
     ensure_dir(stage4_path)
 
     # 1. Save Base -> Task
-    # Format: Index matches 'base_id' (base_0, base_1...), Columns match 'sub_id'
-    out_base = os.path.join(stage4_path, TRAVEL_BASE_TO_TASK_CSV)
+    # Format: Index matches 'base_id' (C57 yard IDs), Columns match 'sub_id'
+    out_base = os.path.join(stage4_path, cfg.travel_base_to_task_csv)
     base_to_task.to_csv(out_base, index=True)
     logger.info(f"Saved Base->Task matrix to: {out_base}")
 
@@ -356,32 +577,47 @@ def save_outputs(base_to_task: pd.DataFrame, task_to_task: pd.DataFrame):
     df_task = task_to_task.copy()
     df_task.reset_index(inplace=True) 
     
-    out_task = os.path.join(stage4_path, TRAVEL_TASK_TO_TASK_CSV)
+    out_task = os.path.join(stage4_path, cfg.travel_task_to_task_csv)
     df_task.to_csv(out_task, index=False)
     logger.info(f"Saved Task->Task matrix to: {out_task}")
 
 
 # ======================= MAIN EXECUTION =======================
 
-def main():
+def main(cfg: Optional[TravelMatrixConfig] = None):
     setup_logging()
     logger = logging.getLogger()
     logger.info("=== build_travel_matrices_osm: START ===")
+    cfg = cfg if cfg is not None else TravelMatrixConfig()
 
     try:
+        limit_to_sub_ids = cfg.limit_to_sub_ids
+        if limit_to_sub_ids is None:
+            limit_to_sub_ids = load_task_ids_from_mapping(cfg.mapping_csv)
+            if limit_to_sub_ids is not None:
+                logger.info(
+                    "Aligned travel task universe to tract mapping baseline: %s substations.",
+                    len(limit_to_sub_ids),
+                )
+
         # 1. Load Data
-        G = load_graph_with_travel_time(GRAPHML_PATH)
-        subs_df = load_substations()
-        
+        G = load_graph_with_travel_time(cfg.graphml_path)
+        subs_df = load_substations(cfg, limit_to_sub_ids=limit_to_sub_ids)
+
         # 2. Map Coordinates to Graph
         sub_to_node = map_points_to_nodes(G, subs_df)
-        base_nodes = get_base_nodes(G)
-        
+        base_nodes = get_base_nodes(G, cfg)
+
         # 3. Compute Matrices
-        base_to_task, task_to_task = compute_travel_times(G, base_nodes, sub_to_node)
-        
+        base_to_task, task_to_task = compute_travel_times(
+            G,
+            base_nodes,
+            sub_to_node,
+            max_travel_time_sec=cfg.max_travel_time_sec,
+        )
+
         # 4. Save
-        save_outputs(base_to_task, task_to_task)
+        save_outputs(base_to_task, task_to_task, cfg)
         
         logger.info("=== build_travel_matrices_osm: DONE ===")
         

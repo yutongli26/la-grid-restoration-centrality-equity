@@ -1,0 +1,17 @@
+scenario_label,yard_id,utility,facility,integer_crews,fractional_crews,raw_visual_weight,active_in_integer_input
+C57_substation_ratio_main,D01,LADWP,Substations Regional Center / Palmetto,1,1.446154,2.000,yes
+C57_substation_ratio_main,D02,LADWP,Central District Headquarters / Wall St.,11,10.846154,15.000,yes
+C57_substation_ratio_main,D03,LADWP,Boylston,1,0.723077,1.000,yes
+C57_substation_ratio_main,D04,LADWP,Valley Center / Saticoy,22,21.692308,30.000,yes
+C57_substation_ratio_main,D05,LADWP,Central Service Center,1,1.446154,2.000,yes
+C57_substation_ratio_main,D06,LADWP,Main Street,11,10.846154,15.000,yes
+C57_substation_ratio_main,D07,SCE,Dominguez Hills Service Center,3,2.173913,5.000,yes
+C57_substation_ratio_main,D08,SCE,Pomona / CRE Pomona Garage,0,0.434783,1.000,no
+C57_substation_ratio_main,D09,SCE,Alhambra,3,2.608696,6.000,yes
+C57_substation_ratio_main,D10,SCE,Santa Monica,1,0.869565,2.000,yes
+C57_substation_ratio_main,D11,SCE,Montebello / 1000 Potrero Grande Dr,0,0.434783,1.000,no
+C57_substation_ratio_main,D12,SCE,Whittier / Santa Fe Springs,2,1.304348,3.000,yes
+C57_substation_ratio_main,D13,SCE,South Bay,1,0.869565,2.000,yes
+C57_substation_ratio_main,D14,SCE,Covina / San Dimas,0,0.434783,1.000,no
+C57_substation_ratio_main,D15,SCE,Monrovia,0,0.434783,1.000,no
+C57_substation_ratio_main,D16,SCE,Long Beach,0,0.434783,1.000,no

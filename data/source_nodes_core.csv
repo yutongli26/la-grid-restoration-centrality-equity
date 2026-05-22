@@ -1,0 +1,7 @@
+source_name,node_id,source_type,active_set,notes
+Sylmar,310199,import_interface_proxy,core,Current 42-node model does not contain Sylmar-Pac Intertie 306691; SYLMAR WEST 310199 is used as the in-model Sylmar injection proxy because it shares ZIP 91344 and has stronger retained connectivity than SYLMAR EAST; active only if f_raw >= tau at time t
+Rinaldi,307693,import_interface_proxy,core,Exact Rinaldi match in the model inventory; active only if f_raw >= tau at time t
+Scattergood,309553,in_basin_generation_proxy,core,Exact Scattergood match in the model inventory; active only if f_raw >= tau at time t
+Harbor,308581,in_basin_generation_proxy,core,Station Q (Harbor) chosen over the weaker Harbor alias because it is the better-connected Harbor-labeled transmission node in the model; active only if f_raw >= tau at time t
+Haynes,304450,in_basin_generation_proxy,core,No literal Haynes node exists in the current model inventory; Harborgen is used as the documented south/east-basin injection proxy; active only if f_raw >= tau at time t
+Valley,309569,in_basin_generation_proxy,core,Exact Valley match in the model inventory; active only if f_raw >= tau at time t

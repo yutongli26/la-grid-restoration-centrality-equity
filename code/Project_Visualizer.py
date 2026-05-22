@@ -1,31 +1,98 @@
 import os
+import re
+import builtins
 import geopandas as gpd
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
+import networkx as nx
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import sys
 import textwrap
+from matplotlib.lines import Line2D
+from matplotlib.ticker import MaxNLocator
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - registers 3D projection
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from pathlib import Path
 import math
 
+VISUALIZER_STRICT_ERRORS = os.environ.get(
+    "VISUALIZER_STRICT_ERRORS",
+    "1",
+).strip().lower() not in {"0", "false", "no", "off"}
+
+VISUALIZER_STRICT_ERROR_MARKERS = (
+    "[Error]",
+    "[GIS Error]",
+    "[GIS Warning]",
+    "[GIS Skip]",
+    "[Warning]",
+    "[Warn]",
+    "[Skip]",
+    " Warning",
+    " warning",
+    "Failed",
+    "failed",
+    "Missing",
+    " missing",
+    "not found",
+    "skipped",
+    "Skipping",
+    " skip ",
+    " skip.",
+    " skip:",
+    "(skip ",
+    "No geometry bounds",
+    "No recognized",
+    "No clusters",
+    "No valid",
+    " is empty",
+    " empty",
+    "all NaN",
+)
+
+VISUALIZER_STRICT_ALLOW_MARKERS = (
+    "[Gantt] Too many crews",
+)
+
+
+def _strict_visualizer_print(*args, **kwargs) -> None:
+    """Print normally, then fail fast on messages that indicate skipped/failed figures."""
+    builtins.print(*args, **kwargs)
+    if not VISUALIZER_STRICT_ERRORS:
+        return
+
+    sep = kwargs.get("sep", " ")
+    end = kwargs.get("end", "\n")
+    message = sep.join(str(arg) for arg in args)
+    if end is not None:
+        message += str(end)
+
+    if any(marker in message for marker in VISUALIZER_STRICT_ALLOW_MARKERS):
+        return
+    if any(marker in message for marker in VISUALIZER_STRICT_ERROR_MARKERS):
+        raise RuntimeError(message.strip())
+
+
+print = _strict_visualizer_print
+
 # =============================================================================
 # Project paths (portable)
 # =============================================================================
-# Project root = directory containing this script.
-PROJECT_ROOT = Path(__file__).resolve().parent
+# Project root = repository root; this script lives under ./code.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# All inputs are stored under ./Data (relative to PROJECT_ROOT).
-DATA_DIR = PROJECT_ROOT / "Data"
+# All inputs are stored under ./data (relative to PROJECT_ROOT).
+DATA_DIR = PROJECT_ROOT / "data"
 
-# All stage output folders live under the project root by convention.
-OUTPUT_ROOT = str(PROJECT_ROOT)
+# All stage output folders live under ./output by convention.
+OUTPUT_ROOT = str(PROJECT_ROOT / "output")
 
 # =============================================================================
 # Inputs (Data/)
 # =============================================================================
-DEVICES_CSV: str = str(DATA_DIR / "Los_Angeles_City_SUBSTATION_with_fragility.csv")
+DEVICES_CSV: str = str(DATA_DIR / "Los_Angeles_City_SUBSTATION_with_fragility_29.csv")
 SHAPEFILE_PATH: str = str(DATA_DIR / "LA_Tracts_With_Population.shp")
 SCENARIOS = ["Northridge", "SanFernando", "LongBeach", "2pc50"]
 
@@ -39,11 +106,11 @@ CITY_BOUNDARY_SHP: str = str(DATA_DIR / "City_Boundary.shp")
 # Pretty variable names for Stage 7 heatmaps/legends (from Visualizer_SL)
 # ------------------------------------------------------------------------------
 PRETTY_VAR_NAMES = {
-    "T80": "Recovery time (T80)",
+    "T80": "Recovery time (T80, hr)",
     "AUC": "AUC",
     "Init_Supply": "Initial Supply",
-    "Grid_Centrality": "Grid centrality",
-    "Grid_ImpactLambda2": "Grid impact (λ2 loss)",
+    "Grid_Degree": "Grid degree",
+    "Grid_Impact": "Grid impact (λ2 loss)",
     "Grid_Betweenness": "Grid betweenness",
     "Redundancy_HHI": "Redundancy (HHI)",
     "Pre_1970_Ratio": "Pre-1970 housing ratio",
@@ -51,38 +118,556 @@ PRETTY_VAR_NAMES = {
     "NRI_RISK_SCORE": "NRI risk score",
     "NRI_EAL_SCORE": "NRI expected annual loss",
     "NRI_BUILDVALUE": "NRI building value",
+    "SVI_SCORE": "SVI score",
     "SVI_THEME1": "SVI Theme 1: Socioeconomic",
     "SVI_THEME2": "SVI Theme 2: Household composition/Disability",
     "SVI_THEME3": "SVI Theme 3: Minority/Language",
     "SVI_THEME4": "SVI Theme 4: Housing/Transport",
 }
 
+STAGE7_SELECTED_THEME_FEATURES = [
+    "T80",
+    "Pre_1970_Ratio",
+    "Pop_Density",
+    "NRI_RISK_SCORE",
+    "NRI_BUILDVALUE",
+    "SVI_SCORE",
+]
+STAGE7_IJDRR_CLUSTER_PALETTE = [
+    "#4477AA",  # muted blue
+    "#DDAA33",  # muted ochre
+    "#228833",  # muted green
+    "#66CCEE",  # soft cyan
+    "#AA3377",  # muted magenta
+    "#BBBBBB",  # neutral grey
+    "#EE6677",  # soft rose
+    "#CCBB44",  # olive yellow
+]
+STAGE7_HOTSPOT_COLOR = "#8B1E3F"
+STAGE2_EXPLORATORY_METRIC_PREFERENCES = [
+    "degree",
+    "betweenness_centrality",
+    "closeness_centrality",
+    "eigenvector_centrality",
+]
+STAGE2_TOP10_MAP_LAYOUT = {"width_cm": 11.4, "height_cm": 8.1}
+STAGE2_TOPOLOGY_MAP_LAYOUT = {"width_cm": 13.2, "height_cm": 8.9}
+
+
+def _stage7_cluster_color_map(clusters: list[str]) -> dict[str, str]:
+    """Return an IJDRR/Elsevier-style muted qualitative palette for clusters."""
+    return {
+        str(cluster): STAGE7_IJDRR_CLUSTER_PALETTE[i % len(STAGE7_IJDRR_CLUSTER_PALETTE)]
+        for i, cluster in enumerate(clusters)
+    }
+
+
+def _canonical_tract_key(series: pd.Series) -> pd.Series:
+    """Normalize tract identifiers to a shared digit-only join key.
+
+    The helper removes whitespace and import artifacts such as trailing decimal
+    suffixes, extracts the numeric tract code, and returns a canonical string
+    representation suitable for joining external Stage 7 enrichment tables.
+    """
+    raw = series.astype(str).str.strip()
+    numeric = pd.to_numeric(raw, errors="coerce")
+    out = raw.copy()
+    if numeric.notna().any():
+        out.loc[numeric.notna()] = (
+            numeric.loc[numeric.notna()]
+            .round()
+            .astype("Int64")
+            .astype(str)
+        )
+    return (
+        out.str.replace(r"\.0$", "", regex=True)
+        .str.extract(r"(\d+)", expand=False)
+        .fillna("")
+        .str.strip()
+    )
+
+
+def _canonical_tract_fips11(series: pd.Series) -> pd.Series:
+    """Normalize tract identifiers to zero-padded 11-digit FIPS keys."""
+    return _canonical_tract_key(series).str.zfill(11)
+
+
+def _canonical_substation_key_value(value) -> str:
+    """Normalize substation IDs for visual joins across CSV import quirks."""
+    s = str(value).strip()
+    try:
+        f = float(s)
+        if np.isfinite(f) and f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+    digits = re.sub(r"\D", "", s)
+    return digits.lstrip("0") if digits else s
+
+
+def _canonical_substation_key(series: pd.Series) -> pd.Series:
+    """Vectorized substation ID normalization for visual joins."""
+    return series.map(_canonical_substation_key_value)
+
+
+def _attach_stage7_svi_score(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach a compact Stage 7 SVI summary score when it is absent.
+
+    The function looks up tract-level SOVI/SVI values from the shared external
+    CSV used by the visualization workflow, aligns them with the current tract
+    table through canonical tract identifiers, and leaves the input unchanged
+    when the enrichment source is unavailable.
+    """
+    if "SVI_SCORE" in df.columns:
+        return df
+
+    svi_path = DATA_DIR / "LA_Census_Tracts_SOVI_Scores_with_Identifiers.csv"
+    if not svi_path.exists():
+        return df
+
+    tract_col = next((c for c in ["tract_id", "TRACT_ID", "GEOID", "TRACTFIPS"] if c in df.columns), None)
+    if tract_col is None:
+        return df
+
+    svi_df = pd.read_csv(svi_path)
+    svi_df.columns = [str(c).strip() for c in svi_df.columns]
+
+    svi_tract_col = next((c for c in ["TRACTFIPS", "tract_id", "GEOID", "TRACT_ID"] if c in svi_df.columns), None)
+    svi_score_col = next((c for c in ["SOVI_SCORE", "SVI_SCORE"] if c in svi_df.columns), None)
+    if svi_df.empty or svi_tract_col is None or svi_score_col is None:
+        return df
+
+    tract_keys = _canonical_tract_key(df[tract_col])
+    svi_keys = _canonical_tract_key(svi_df[svi_tract_col])
+    svi_scores = pd.to_numeric(svi_df[svi_score_col], errors="coerce")
+
+    svi_map = (
+        pd.DataFrame({"_tract_key": svi_keys, "SVI_SCORE": svi_scores})
+        .dropna(subset=["_tract_key"])
+        .drop_duplicates("_tract_key", keep="first")
+        .set_index("_tract_key")["SVI_SCORE"]
+    )
+
+    merged = df.copy()
+    merged["SVI_SCORE"] = tract_keys.map(svi_map)
+    return merged
+
+
+def _stage7_hotspot_ids(stage7_dir: str, df_stage7: pd.DataFrame | None = None) -> set[str]:
+    """Return Stage 7 top slow-vulnerable tract IDs as 11-digit FIPS keys."""
+    def _flag_mask(series: pd.Series) -> pd.Series:
+        if pd.api.types.is_bool_dtype(series):
+            return series.fillna(False)
+        return (
+            series.astype(str)
+            .str.strip()
+            .str.lower()
+            .isin({"true", "1", "yes", "y"})
+        )
+
+    if df_stage7 is not None and "tract_id" in df_stage7.columns:
+        if "SlowVulnerable_Hotspot_Top10" in df_stage7.columns:
+            ids = _canonical_tract_fips11(
+                df_stage7.loc[_flag_mask(df_stage7["SlowVulnerable_Hotspot_Top10"]), "tract_id"]
+            )
+            ids = ids.dropna()
+            if not ids.empty:
+                return set(ids)
+
+        if "SlowVulnerable_Hotspot_Rank" in df_stage7.columns:
+            ranks = pd.to_numeric(df_stage7["SlowVulnerable_Hotspot_Rank"], errors="coerce")
+            ids = _canonical_tract_fips11(df_stage7.loc[ranks <= 10, "tract_id"])
+            ids = ids.dropna()
+            if not ids.empty:
+                return set(ids)
+
+    top10_path = os.path.join(stage7_dir, "stage7_top10_slow_vulnerable_tracts.csv")
+    if os.path.exists(top10_path):
+        top10_df = pd.read_csv(top10_path)
+        if "tract_id" in top10_df.columns:
+            ids = _canonical_tract_fips11(top10_df["tract_id"]).dropna()
+            return set(ids)
+
+    return set()
+
 
 # =============================================================================
-# Global plotting style (kept as module-level side effects)
+# Publication plotting system (Sustainable Cities and Society / Elsevier)
 # =============================================================================
-plt.style.use("seaborn-v0_8-whitegrid")
-plt.rcParams["font.family"] = "sans-serif"
-plt.rcParams["figure.dpi"] = 150
-plt.rcParams["savefig.dpi"] = 300
-plt.rcParams["axes.unicode_minus"] = False
+CM_PER_INCH = 2.54
+EXPORT_DPI = 300
+EXPORT_PAD_INCHES = 0.04
+
+# Final manuscript typography (points)
+FS_TITLE = 9.5
+FS_LABEL = 8.5
+FS_TICK = 7.5
+FS_LEGEND = 7.5
+FS_COLORBAR = 7.5
+FS_PANEL = 9.5
+FS_SUPTITLE = 10.0
+FS_ANNOTATION = 7.0
+
+# Figure roles are defined in centimeters so exported figures are created at
+# their intended final manuscript size rather than scaled down later.
+COMPOSITE_FULL_DEFAULT = {"width_cm": 18.5, "height_cm": 11.8}
+COMPOSITE_FULL_DENSE = {"width_cm": 19.0, "height_cm": 13.0}
+COMPOSITE_MEDIUM = {"width_cm": 14.5, "height_cm": 9.5}
+PANEL_FULLROW = {"width_cm": 17.9, "height_cm": 6.2}
+PANEL_HALF = {"width_cm": 8.9, "height_cm": 6.6}
+PANEL_THIRD = {"width_cm": 5.9, "height_cm": 5.4}
+PANEL_ASYM_LEFT = {"width_cm": 11.6, "height_cm": 6.5}
+PANEL_ASYM_RIGHT = {"width_cm": 6.6, "height_cm": 9.4}
+PANEL_MAP_TALL = {"width_cm": 8.9, "height_cm": 11.8}
+PANEL_GANTT = {"width_cm": 18.8, "height_cm": 9.8}
+
+FIGURE_SIZE_PRESETS = {
+    "COMPOSITE_FULL_DEFAULT": COMPOSITE_FULL_DEFAULT,
+    "COMPOSITE_FULL_DENSE": COMPOSITE_FULL_DENSE,
+    "COMPOSITE_MEDIUM": COMPOSITE_MEDIUM,
+    "PANEL_FULLROW": PANEL_FULLROW,
+    "PANEL_HALF": PANEL_HALF,
+    "PANEL_THIRD": PANEL_THIRD,
+    "PANEL_ASYM_LEFT": PANEL_ASYM_LEFT,
+    "PANEL_ASYM_RIGHT": PANEL_ASYM_RIGHT,
+    "PANEL_MAP_TALL": PANEL_MAP_TALL,
+    "PANEL_GANTT": PANEL_GANTT,
+}
+
+PUBLICATION_RCPARAMS = {
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "axes.titlesize": FS_TITLE,
+    "axes.labelsize": FS_LABEL,
+    "xtick.labelsize": FS_TICK,
+    "ytick.labelsize": FS_TICK,
+    "legend.fontsize": FS_LEGEND,
+    "legend.title_fontsize": FS_LEGEND,
+    "figure.dpi": 150,
+    "savefig.dpi": EXPORT_DPI,
+    "axes.unicode_minus": False,
+    "axes.linewidth": 0.6,
+    "grid.linewidth": 0.4,
+    "grid.color": "#d9d9d9",
+    "lines.linewidth": 1.2,
+    "patch.linewidth": 0.5,
+    "xtick.major.width": 0.6,
+    "ytick.major.width": 0.6,
+    "xtick.major.size": 3.0,
+    "ytick.major.size": 3.0,
+    "axes.titlepad": 4.0,
+}
 
 # ==============================================================================
 # Helpers
 # ==============================================================================
-def ensure_dir(directory: str) -> bool:
-    """Return True if directory exists; otherwise warn and return False."""
-    if not os.path.exists(directory):
-        print(f"  [Warning] Directory not found: {directory}")
-        return False
-    return True
+def cm_to_inch(*values):
+    """Convert centimeters to inches for matplotlib figsize use."""
+    if len(values) == 1 and isinstance(values[0], (tuple, list)):
+        values = tuple(values[0])
+    converted = tuple(v / CM_PER_INCH for v in values)
+    return converted[0] if len(converted) == 1 else converted
+
+
+def get_figsize(
+    role: str = "PANEL_FULLROW",
+    width_cm=None,
+    height_cm=None,
+    scale_width: float = 1.0,
+    scale_height: float = 1.0,
+):
+    """Return a manuscript-scaled figure size in inches.
+
+    Figure roles are defined in centimeters so exported panels match their
+    intended final publication footprint. Optional explicit width/height
+    overrides and independent scale factors allow local adjustments without
+    breaking the shared size system.
+    """
+    preset = FIGURE_SIZE_PRESETS.get(role, PANEL_FULLROW)
+    w_cm = preset["width_cm"] if width_cm is None else width_cm
+    h_cm = preset["height_cm"] if height_cm is None else height_cm
+    return cm_to_inch(w_cm * scale_width, h_cm * scale_height)
+
+
+def apply_publication_style() -> None:
+    """Apply restrained journal-style defaults across plot families."""
+    sns.set_theme(context="paper", style="whitegrid", rc=PUBLICATION_RCPARAMS)
+    plt.rcParams.update(PUBLICATION_RCPARAMS)
+
+
+def style_axis(
+    ax,
+    title=None,
+    xlabel=None,
+    ylabel=None,
+    title_pad: float = 4.0,
+    title_size: float | None = None,
+    title_weight: str = "semibold",
+    xrotation=None,
+    yrotation=None,
+):
+    """Apply the shared publication axis style used across all panels.
+
+    This helper centralizes panel title formatting, axis-label typography,
+    tick styling, and optional label rotation so the visual language remains
+    consistent across map, curve, and diagnostic figures.
+    """
+    if title is not None:
+        ax.set_title(
+            title,
+            fontsize=FS_PANEL if title_size is None else title_size,
+            fontweight=title_weight,
+            pad=title_pad,
+        )
+    if xlabel is not None:
+        ax.set_xlabel(xlabel, fontsize=FS_LABEL)
+    if ylabel is not None:
+        ax.set_ylabel(ylabel, fontsize=FS_LABEL)
+    ax.tick_params(axis="both", which="major", labelsize=FS_TICK, width=0.6, length=3)
+    if xrotation is not None:
+        ax.tick_params(axis="x", labelrotation=xrotation)
+    if yrotation is not None:
+        ax.tick_params(axis="y", labelrotation=yrotation)
+    return ax
+
+
+def style_colorbar(cbar, label=None) -> None:
+    """Apply consistent colorbar text and stroke styling."""
+    if label is not None:
+        cbar.set_label(label, fontsize=FS_COLORBAR)
+    cbar.ax.tick_params(labelsize=FS_COLORBAR, width=0.6, length=2.5)
+    if hasattr(cbar, "outline") and cbar.outline is not None:
+        cbar.outline.set_linewidth(0.6)
+
+
+def _build_endpoint_ticks(vmin: float, vmax: float, include_zero: bool = True) -> list[float]:
+    """Create explicit colorbar ticks that always include the true endpoints."""
+    if not (np.isfinite(vmin) and np.isfinite(vmax)):
+        return []
+
+    if np.isclose(vmin, vmax):
+        return [float(vmin)]
+
+    raw_ticks = [float(vmin), float(vmax)]
+    if include_zero and vmin < 0 < vmax:
+        raw_ticks.extend([float(vmin / 2.0), 0.0, float(vmax / 2.0)])
+    else:
+        interior = np.linspace(vmin, vmax, 5)[1:-1]
+        raw_ticks.extend([float(x) for x in interior])
+
+    ticks = []
+    atol = max(1e-9, abs(vmax - vmin) * 1e-6)
+    for tick in sorted(raw_ticks):
+        if not any(np.isclose(tick, existing, rtol=0.0, atol=atol) for existing in ticks):
+            ticks.append(float(tick))
+    return ticks
+
+
+def _format_colorbar_ticklabels(ticks: list[float]) -> list[str]:
+    """Format colorbar ticks consistently while keeping endpoints explicit."""
+    labels = []
+    for tick in ticks:
+        val = 0.0 if np.isclose(tick, 0.0, atol=1e-12) else float(tick)
+        labels.append(f"{val:.2f}")
+    return labels
+
+
+def style_colorbar_with_endpoints(cbar, vmin: float, vmax: float, label=None, include_zero: bool = True) -> None:
+    """Style a colorbar and force endpoint ticks/labels to match the plotted range."""
+    ticks = _build_endpoint_ticks(vmin, vmax, include_zero=include_zero)
+    style_colorbar(cbar, label=label)
+    if ticks:
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels(_format_colorbar_ticklabels(ticks))
+
+
+def format_legend(legend):
+    """Style a legend in the shared publication format."""
+    if legend is None:
+        return None
+
+    frame = legend.get_frame()
+    if frame is not None:
+        frame.set_facecolor("white")
+        frame.set_edgecolor("#c8c8c8")
+        frame.set_linewidth(0.6)
+        frame.set_alpha(0.95)
+
+    title = legend.get_title()
+    if title is not None:
+        title.set_fontsize(FS_LEGEND)
+
+    for text in legend.get_texts():
+        text.set_fontsize(FS_LEGEND)
+
+    return legend
+
+
+def save_figure(fig: plt.Figure, path: str, close: bool = True) -> None:
+    """Standardized export for all figures in this module."""
+    fig.patch.set_facecolor("white")
+    fig.savefig(
+        path,
+        dpi=EXPORT_DPI,
+        bbox_inches="tight",
+        pad_inches=EXPORT_PAD_INCHES,
+        facecolor="white",
+        edgecolor="none",
+    )
+    if close:
+        plt.close(fig)
+
 
 def save_plot(fig: plt.Figure, folder: str, filename: str) -> None:
     """Save and close a matplotlib figure."""
     path = os.path.join(folder, filename)
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, path, close=True)
     print(f"  [Saved] {filename}")
+
+
+def save_plot_variants(fig: plt.Figure, folder: str, filenames: list[str]) -> None:
+    """Save a figure to multiple filenames using shared export settings."""
+    for idx, filename in enumerate(filenames):
+        path = os.path.join(folder, filename)
+        save_figure(fig, path, close=(idx == len(filenames) - 1))
+        print(f"  [Saved] {filename}")
+
+
+def _stage2_choose_x_axis(df: pd.DataFrame, fallback_col: str) -> str:
+    """Select the preferred x-axis column for Stage 2 percolation plots."""
+    if "fraction_removed" in df.columns:
+        return "fraction_removed"
+    if "nodes_removed" in df.columns:
+        return "nodes_removed"
+    df[fallback_col] = np.arange(len(df)) / max(len(df) - 1, 1)
+    return fallback_col
+
+
+def _stage2_detect_id_col(df: pd.DataFrame) -> str:
+    """Detect the most likely substation identifier column in a Stage 2 table."""
+    return next(
+        (col for col in df.columns if "substation" in col.lower() and "id" in col.lower()),
+        df.columns[0],
+    )
+
+
+def _stage2_detect_metrics(df: pd.DataFrame, id_col: str) -> list[str]:
+    """Identify Stage 2 numeric centrality and impact metrics for plotting.
+
+    Preferred metrics are emitted first so downstream figures preserve a stable
+    manuscript ordering, then additional numeric columns with recognizable
+    centrality-related names are appended as exploratory metrics.
+    """
+    preferred = [
+        "impact_centrality",
+        "impact_population",
+        "degree",
+        "betweenness_centrality",
+        "closeness_centrality",
+        "eigenvector_centrality",
+    ]
+    tokens = ["centrality", "impact", "degree", "betweenness", "closeness", "eigenvector"]
+    numeric_cols = [col for col in df.select_dtypes(include=[np.number]).columns if col != id_col]
+
+    detected = [col for col in preferred if col in numeric_cols]
+    for col in numeric_cols:
+        lower = col.lower()
+        if col not in detected and any(token in lower for token in tokens):
+            detected.append(col)
+
+    return detected
+
+
+def _load_stage2_graph(edges_csv: str, baseline_nodes: list[str]) -> nx.Graph:
+    """Rebuild the Stage 2 substation graph from the exported edge table."""
+    edges_df = pd.read_csv(edges_csv, dtype=str)
+    if edges_df.empty:
+        graph = nx.Graph()
+        graph.add_nodes_from(baseline_nodes)
+        return graph
+
+    u_col = "u" if "u" in edges_df.columns else edges_df.columns[0]
+    v_col = "v" if "v" in edges_df.columns else edges_df.columns[1]
+    baseline_set = set(baseline_nodes)
+
+    graph = nx.Graph()
+    graph.add_nodes_from(baseline_nodes)
+    for _, row in edges_df.iterrows():
+        u = str(row[u_col]).strip().split(".")[0]
+        v = str(row[v_col]).strip().split(".")[0]
+        if u in baseline_set and v in baseline_set and u and v and u != v:
+            graph.add_edge(u, v)
+    return graph
+
+
+def _compute_percolation_curve(graph: nx.Graph, ordered_nodes: list[str]) -> pd.DataFrame:
+    """Compute the largest-component trajectory under ordered node removals."""
+    working = graph.copy()
+    total_nodes = working.number_of_nodes()
+    records = []
+
+    lcc_size = max((len(c) for c in nx.connected_components(working)), default=0) if total_nodes else 0
+    records.append(
+        {
+            "nodes_removed": 0,
+            "lcc_size": int(lcc_size),
+            "lcc_fraction": float(lcc_size / total_nodes) if total_nodes else np.nan,
+        }
+    )
+
+    for idx, node in enumerate(ordered_nodes, start=1):
+        if working.has_node(node):
+            working.remove_node(node)
+        lcc_size = max((len(c) for c in nx.connected_components(working)), default=0) if working.number_of_nodes() else 0
+        records.append(
+            {
+                "nodes_removed": idx,
+                "lcc_size": int(lcc_size),
+                "lcc_fraction": float(lcc_size / total_nodes) if total_nodes else np.nan,
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+def _build_stage2_exploratory_curves(
+    stage_dir: str,
+    centrality_df: pd.DataFrame,
+    id_col: str,
+    available_metrics: list[str],
+) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """Generate exploratory targeted-attack curves for auxiliary Stage 2 metrics."""
+    graph = _load_stage2_graph(CEC_GRAPH_EDGES_CSV, centrality_df[id_col].astype(str).tolist())
+    if graph.number_of_nodes() == 0:
+        return {}, []
+
+    exploratory_metrics = [metric for metric in STAGE2_EXPLORATORY_METRIC_PREFERENCES if metric in available_metrics]
+    curves: dict[str, pd.DataFrame] = {}
+
+    for metric in exploratory_metrics:
+        ranking = centrality_df[[id_col, metric]].copy()
+        ranking[metric] = pd.to_numeric(ranking[metric], errors="coerce")
+        ranking = ranking[np.isfinite(ranking[metric])].copy()
+        if ranking.empty:
+            continue
+
+        ranking = ranking.sort_values(
+            by=[metric, id_col],
+            ascending=[False, True],
+            kind="mergesort",
+        )
+        order = ranking[id_col].astype(str).tolist()
+        missing = sorted(set(graph.nodes()) - set(order))
+        order.extend(missing)
+
+        curve = _compute_percolation_curve(graph, order)
+        curves[metric] = curve
+        curve.to_csv(os.path.join(stage_dir, f"exploratory_percolation_curve_{metric}.csv"), index=False)
+
+    return curves, exploratory_metrics
+
+
+apply_publication_style()
 
 def load_shapefile():
     """
@@ -125,13 +710,15 @@ def plot_map(
     vmax=None,
     cmap_low: float = 0.1,
     cmap_high: float = 1.0,
+    figure_role: str = "PANEL_MAP_TALL",
 ):
     """
-    Enhanced mapping utility:
-      1) Robust tract-id matching with multiple strategies.
-      2) Optional shared vmin/vmax (if provided).
-      3) Truncated colormap (cuts off very light colors).
-      4) Larger title/label/ticks for publication-ready maps.
+    Render a tract-level choropleth using the shared publication map style.
+
+    The routine performs robust tract-ID alignment between the supplied
+    GeoDataFrame and metric series, supports externally imposed color limits for
+    cross-panel comparability, and exports the final figure at the configured
+    manuscript size with consistent colorbar and typography settings.
     """
     if gdf is None:
         return
@@ -149,8 +736,6 @@ def plot_map(
         .str.split(".").str[0]
         .str.strip()
     )
-
-    print(f"\n[GIS Debug] Trying to map: {title}")
 
     # ---- Matching strategies ----
     matched_gdf = None
@@ -192,7 +777,7 @@ def plot_map(
     print(f"   ✅ Final Map Area: {best_match_count} tracts.")
 
     # ---- Plot ----
-    fig, ax = plt.subplots(figsize=(10, 10))
+    fig, ax = plt.subplots(figsize=get_figsize(figure_role))
 
     # vmin/vmax based on finite values only
     data_vals = matched_gdf["val"].astype(float)
@@ -236,22 +821,14 @@ def plot_map(
 
     ticks = np.linspace(vmin, vmax, 5)
     cbar = fig.colorbar(sm, cax=cax, ticks=ticks)
-    cbar.ax.set_yticklabels([f"{t:.2f}" for t in ticks], fontsize=25)
-    cbar.set_label(label, fontsize=25)
+    cbar.ax.set_yticklabels([f"{t:.2f}" for t in ticks])
+    style_colorbar(cbar, label=label)
 
-    ax.set_title(title, fontsize=25, fontweight="bold", pad=12)
+    style_axis(ax, title=title)
     ax.axis("off")
 
     # Save
-    if "save_plot" in globals():
-        save_plot(fig, output_dir, filename)
-    else:
-        import os  # kept to preserve the original structure/behavior
-
-        os.makedirs(output_dir, exist_ok=True)
-        plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight")
-
-    plt.close(fig)
+    save_plot(fig, output_dir, filename)
 
 def vis_stage1(gdf):
     """
@@ -262,24 +839,21 @@ def vis_stage1(gdf):
       - MC_Device_Damage_AvgDS_<SCEN>.csv  columns: substation_id, scenario, avg_damage_state
 
     Outputs:
-      - map_supply_<SCEN>.png
-      - hist_supply_<SCEN>.png
-      - hist_sub_avg_ds_<SCEN>.png
+      - vis_stage1_map_supply_<SCEN>.png
+      - vis_stage1_hist_supply_<SCEN>.png
+      - vis_stage1_hist_sub_avg_ds_<SCEN>.png
     """
     stage_dir = os.path.join(OUTPUT_ROOT, "Stage 1 Output")
-    if not ensure_dir(stage_dir):
+    if not os.path.exists(stage_dir):
+        print(f"  [Warning] Directory not found: {stage_dir}")
         return
 
     print("--- Visualizing Stage 1 ---")
 
     # -------------------------------------------------------------------------
-    # Global plotting style (big fonts, readable)
+    # Publication plotting style
     # -------------------------------------------------------------------------
-    try:
-        sns.set_style("whitegrid")
-        sns.set_context("talk", font_scale=1.2)
-    except Exception:
-        plt.style.use("ggplot")
+    apply_publication_style()
 
     # -------------------------------------------------------------------------
     # 1) Global color normalization for SUPPLY maps (consistent across scenarios)
@@ -338,19 +912,20 @@ def vis_stage1(gdf):
                 plot_map(
                     gdf=gdf,
                     data_series=supply,
-                    title=f"Mean Supply - {scen}",
+                    title=f"Mean supply: {scen}",
                     output_dir=stage_dir,
-                    filename=f"map_supply_{scen}.png",
+                    filename=f"vis_stage1_map_supply_{scen}.png",
                     cmap="RdBu",
                     label="Mean Supply (0–1)",
                     vmin=0.0,     
                     vmax=1.0,     
                     cmap_low=0.0,
                     cmap_high=1.0,
+                    figure_role="PANEL_MAP_TALL",
                 )
 
                 # Distribution: histogram + KDE
-                fig, ax = plt.subplots(figsize=(8, 5))
+                fig, ax = plt.subplots(figsize=get_figsize("PANEL_ASYM_LEFT"))
                 sns.histplot(
                     supply.dropna(),
                     bins=np.linspace(0, 1, 21),
@@ -361,18 +936,14 @@ def vis_stage1(gdf):
                     alpha=0.6,
                     ax=ax,
                 )
-                ax.set_title(
-                    f"Distribution of Mean Supply - {scen}",
-                    fontsize=20,
-                    fontweight="bold",
-                    pad=10,
+                style_axis(
+                    ax,
+                    title=scen,
+                    xlabel="Mean Supply (0-1)",
+                    ylabel="Density",
                 )
-                ax.set_xlabel("Mean Supply (0–1)", fontsize=18)
-                ax.set_ylabel("Density", fontsize=18)
                 ax.set_xlim(0.0, 1.0)
-                ax.tick_params(axis="both", labelsize=14)
-
-                save_plot(fig, stage_dir, f"hist_supply_{scen}.png")
+                save_plot(fig, stage_dir, f"vis_stage1_hist_supply_{scen}.png")
                 plt.close(fig)
             else:
                 print(f"  [Stage 1] Missing columns in {supply_file}; expected tract_id & supply.")
@@ -382,7 +953,7 @@ def vis_stage1(gdf):
         if os.path.exists(dev_file):
             df = pd.read_csv(dev_file)
 
-            fig, ax = plt.subplots(figsize=(8, 5))
+            fig, ax = plt.subplots(figsize=get_figsize("PANEL_ASYM_LEFT"))
             sns.histplot(
                 data=df,
                 x="avg_damage_state",
@@ -401,18 +972,14 @@ def vis_stage1(gdf):
                 ax=ax,
             )
 
-            ax.set_title(
-                f"Substation Average Damage State – {scen}",
-                fontsize=20,
-                fontweight="bold",
-                pad=10,
+            style_axis(
+                ax,
+                title=scen,
+                xlabel="Average damage state (0 = none, 4 = collapse)",
+                ylabel="Density",
             )
-            ax.set_xlabel("Average damage state (0 = none, 4 = collapse)", fontsize=18)
-            ax.set_ylabel("Density", fontsize=18)
             ax.set_xlim(0.0, 4.0)
-            ax.tick_params(axis="both", labelsize=14)
-
-            save_plot(fig, stage_dir, f"hist_sub_avg_ds_{scen}.png")
+            save_plot(fig, stage_dir, f"vis_stage1_hist_sub_avg_ds_{scen}.png")
             plt.close(fig)
 
 # ==============================================================================
@@ -424,13 +991,13 @@ def vis_stage2_topology_with_tracts_latlon():
 
     Layers:
       - City boundary polygon (CITY_BOUNDARY_SHP) as clip/extent reference
-      - Census tracts basemap (clipped to city)
       - Original CEC transmission lines (clipped to city bbox)
       - Stage 2 simplified topology edges (CEC_GRAPH_EDGES_CSV)
       - CEC substations (DEVICES_CSV), with robust ID matching
     """
     stage_dir = os.path.join(OUTPUT_ROOT, "Stage 2 Output")
-    if not ensure_dir(stage_dir):
+    if not os.path.exists(stage_dir):
+        print(f"  [Warning] Directory not found: {stage_dir}")
         return
 
     print("--- Visualizing Stage 2 topology (Original Style + Fixed IDs) ---")
@@ -441,7 +1008,6 @@ def vis_stage2_topology_with_tracts_latlon():
     required_paths = [
         (CEC_GRAPH_EDGES_CSV, "CEC_GRAPH_EDGES_CSV"),
         (DEVICES_CSV, "DEVICES_CSV"),
-        (SHAPEFILE_PATH, "SHAPEFILE_PATH"),
         (CEC_TRANSMISSION_SHP, "CEC_TRANSMISSION_SHP"),
         (CITY_BOUNDARY_SHP, "CITY_BOUNDARY_SHP"),
     ]
@@ -451,10 +1017,9 @@ def vis_stage2_topology_with_tracts_latlon():
             return
 
     # -------------------------------------------------------------------------
-    # 2) Load GIS basemap layers (city boundary + tracts) in WGS84 (EPSG:4326)
+    # 2) Load GIS basemap layer (city boundary) in WGS84 (EPSG:4326)
     # -------------------------------------------------------------------------
     city = gpd.read_file(CITY_BOUNDARY_SHP)
-    tracts = gpd.read_file(SHAPEFILE_PATH)
     if city.crs is None:
         minx, miny, maxx, maxy = city.total_bounds
         if -180 <= minx <= 180 and -90 <= miny <= 90:
@@ -468,43 +1033,14 @@ def vis_stage2_topology_with_tracts_latlon():
             
     city = city.to_crs(epsg=4326)
 
-    if tracts.crs is None:
-        tracts = tracts.set_crs(epsg=4326)
-    else:
-        tracts = tracts.to_crs(epsg=4326)
-
-    # Clip tracts to city boundary (fallback to intersects if clip fails)
-    try:
-        tracts_la = gpd.clip(tracts, city)
-    except Exception:
-        tracts_la = tracts[tracts.geometry.intersects(city.union_all())].copy()
-
     # -------------------------------------------------------------------------
     # 3) Load topology edges + devices; robust ID matching for coordinates
     # -------------------------------------------------------------------------
     edf = pd.read_csv(CEC_GRAPH_EDGES_CSV)
     devices = pd.read_csv(DEVICES_CSV)
 
-    import re
-
-    def robust_id_clean(val):
-        """Normalize IDs like 661.0 -> '661' and 'SS0661' -> '661'."""
-        s = str(val).strip()
-
-        # Try numeric cleanup first
-        try:
-            f = float(s)
-            if f.is_integer():
-                return str(int(f))
-        except Exception:
-            pass
-
-        # Otherwise strip non-digits and remove leading zeros
-        digits = re.sub(r"\D", "", s)
-        return digits.lstrip("0") if digits else s
-
     # Edge-side ID universe (use u column)
-    edge_ids = set(edf["u"].apply(robust_id_clean))
+    edge_ids = set(edf["u"].apply(_canonical_substation_key_value))
 
     # Find best-matching device ID column by overlap with edge IDs
     best_col = None
@@ -516,7 +1052,7 @@ def vis_stage2_topology_with_tracts_latlon():
         if col not in devices.columns:
             continue
         try:
-            dev_ids = devices[col].apply(robust_id_clean)
+            dev_ids = devices[col].apply(_canonical_substation_key_value)
             overlap = len(edge_ids.intersection(set(dev_ids)))
             if overlap > max_overlap:
                 max_overlap = overlap
@@ -531,11 +1067,11 @@ def vis_stage2_topology_with_tracts_latlon():
         return
 
     print(f"   ✅ Smart Match: Using column '{best_col}' (Matches {max_overlap} edges)")
-    devices["id_match"] = devices[best_col].apply(robust_id_clean)
+    devices["id_match"] = devices[best_col].apply(_canonical_substation_key_value)
 
     # Clean edge endpoint IDs for mapping
-    edf["u_clean"] = edf["u"].apply(robust_id_clean)
-    edf["v_clean"] = edf["v"].apply(robust_id_clean)
+    edf["u_clean"] = edf["u"].apply(_canonical_substation_key_value)
+    edf["v_clean"] = edf["v"].apply(_canonical_substation_key_value)
 
     # Identify lat/lon fields in devices
     lat_col = next((c for c in ["lat", "Latitude", "Lat", "LAT", "LATITUDE"] if c in devices.columns), None)
@@ -601,7 +1137,13 @@ def vis_stage2_topology_with_tracts_latlon():
     # -------------------------------------------------------------------------
     # 6) Plot
     # -------------------------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 10))
+    fig, ax = plt.subplots(
+        figsize=get_figsize(
+            "PANEL_MAP_TALL",
+            width_cm=STAGE2_TOPOLOGY_MAP_LAYOUT["width_cm"],
+            height_cm=STAGE2_TOPOLOGY_MAP_LAYOUT["height_cm"],
+        )
+    )
 
     # City boundary
     city.plot(
@@ -610,16 +1152,6 @@ def vis_stage2_topology_with_tracts_latlon():
         edgecolor="#bdbdbd",
         linewidth=1.2,
         zorder=0,
-    )
-
-    # Tracts basemap
-    tracts_la.plot(
-        ax=ax,
-        facecolor="none",
-        edgecolor="#f0f0f0",
-        linewidth=0.3,
-        alpha=0.3,
-        zorder=0.5,
     )
 
     # Original CEC lines
@@ -637,8 +1169,8 @@ def vis_stage2_topology_with_tracts_latlon():
     g_edges.plot(
         ax=ax,
         color="#1f77b4",
-        linewidth=1.0,
-        alpha=0.95,
+        linewidth=0.58,
+        alpha=0.50,
         zorder=2,
         label="Simplified topology",
     )
@@ -648,20 +1180,15 @@ def vis_stage2_topology_with_tracts_latlon():
         ax=ax,
         marker="x",
         color="#e6550d",
-        markersize=40,
+        markersize=34,
         linewidth=1.0,
         zorder=3,
         label="CEC substations",
     )
 
-    ax.set_title(
-        "High-Voltage Transmission Network and Substations – City of Los Angeles",
-        fontsize=16,
-        pad=14,
-    )
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
+    style_axis(ax, xlabel="Longitude", ylabel="Latitude")
     ax.set_aspect("equal", "box")
+    ax.set_anchor("C")
 
     # Deduplicate legend entries
     handles, labels = ax.get_legend_handles_labels()
@@ -671,8 +1198,6 @@ def vis_stage2_topology_with_tracts_latlon():
         if l not in seen:
             seen.add(l)
             uniq.append((h, l))
-    if uniq:
-        ax.legend(*zip(*uniq), loc="lower left", frameon=True)
 
     # Viewport based on city bbox with padding
     dx, dy = xmax - xmin, ymax - ymin
@@ -680,11 +1205,32 @@ def vis_stage2_topology_with_tracts_latlon():
     ax.set_ylim(ymin - 0.02 * dy, ymax + 0.02 * dy)
 
     ax.grid(False)
+    fig.subplots_adjust(left=0.09, right=0.985, top=0.985, bottom=0.19)
+    if uniq:
+        legend_handles, legend_labels = zip(*uniq)
+        legend = ax.legend(
+            handles=legend_handles,
+            labels=legend_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.135),
+            ncol=3,
+            frameon=False,
+            borderpad=0.12,
+            labelspacing=0.18,
+            handletextpad=0.28,
+            borderaxespad=0.0,
+            columnspacing=0.55,
+            handlelength=1.35,
+        )
+        format_legend(legend)
+
     save_plot(fig, stage_dir, "vis_stage2_topology_with_tracts_latlon.png")
 
 def vis_stage2_top10_map():
+    """Create the Stage 2 map highlighting the top-10 impact-centrality substations."""
     stage_dir = os.path.join(OUTPUT_ROOT, "Stage 2 Output")
-    if not ensure_dir(stage_dir):
+    if not os.path.exists(stage_dir):
+        print(f"  [Warning] Directory not found: {stage_dir}")
         return
 
     print("--- Visualizing Stage 2 Top10 on Map (Pure & Simple) ---")
@@ -734,13 +1280,10 @@ def vis_stage2_top10_map():
         return
 
     # -------------------------------------------------------------------------
-    # 3) Merge Top10 with devices via simple string join key
+    # 3) Merge Top10 with devices via standardized substation join key
     # -------------------------------------------------------------------------
-    def _clean_id_series(s: pd.Series) -> pd.Series:
-        return s.astype(str).str.strip().str.replace(".0", "", regex=False)
-
-    top10["join_key"] = _clean_id_series(top10[id_col])
-    devices["join_key"] = _clean_id_series(devices[dev_id_col])
+    top10["join_key"] = _canonical_substation_key(top10[id_col])
+    devices["join_key"] = _canonical_substation_key(devices[dev_id_col])
 
     merged = top10.merge(devices, on="join_key", how="left")
 
@@ -771,7 +1314,13 @@ def vis_stage2_top10_map():
     # -------------------------------------------------------------------------
     # 5) Plot
     # -------------------------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(6, 8.5))
+    fig, ax = plt.subplots(
+        figsize=get_figsize(
+            "PANEL_ASYM_RIGHT",
+            width_cm=STAGE2_TOP10_MAP_LAYOUT["width_cm"],
+            height_cm=STAGE2_TOP10_MAP_LAYOUT["height_cm"],
+        )
+    )
 
     # Tract boundaries basemap
     if tracts is not None and not tracts.empty:
@@ -809,11 +1358,11 @@ def vis_stage2_top10_map():
     all_subs_gdf.plot(
         ax=ax,
         marker="o",
-        facecolor="#808080",
+        facecolor="#6f6f6f",
         edgecolor="none",
-        markersize=12,
-        alpha=0.30,
-        label="All substations",
+        markersize=14,
+        alpha=0.42,
+        label="Substations",
         zorder=1,
     )
 
@@ -822,25 +1371,49 @@ def vis_stage2_top10_map():
         top10_gdf.plot(
             ax=ax,
             marker="*",
-            markersize=200,
+            markersize=78,
             facecolor="#f4a300",
             edgecolor="black",
             linewidth=0.8,
-            label="Top10 impact",
+            label="Top 10 by impact centrality",
             zorder=2,
         )
 
         # Rank annotations
+        # Keep labels predominantly on the same side of each marker and
+        # manually stagger the densest cluster to avoid overlap.
+        rank_offsets = {
+            1: (6, 8),
+            2: (10, 13),
+            3: (12, 3),
+            4: (8, -12),
+            5: (12, -8),
+            6: (6, 8),
+            7: (8, 5),
+            8: (8, -18),
+            9: (-9, 10),
+            10: (8, -10),
+        }
         for _, row in top10_gdf.iterrows():
             if pd.notnull(row.geometry):
+                rank_val = int(row["rank"])
+                x_off, y_off = rank_offsets.get(rank_val, (7, 5))
                 ax.annotate(
-                    text=str(row["rank"]),
+                    text=str(rank_val),
                     xy=(row.geometry.x, row.geometry.y),
-                    xytext=(4, 4),
+                    xytext=(x_off, y_off),
                     textcoords="offset points",
-                    fontsize=11,
-                    fontweight="bold",
-                    color="black",
+                    fontsize=max(FS_ANNOTATION - 1.0, 5.6),
+                    fontweight="semibold",
+                    color="#222222",
+                    ha="left" if x_off >= 0 else "right",
+                    va="bottom" if y_off >= 0 else "top",
+                    bbox=dict(
+                        boxstyle="round,pad=0.08",
+                        facecolor="white",
+                        edgecolor="none",
+                        alpha=0.78,
+                    ),
                 )
 
     # -------------------------------------------------------------------------
@@ -879,57 +1452,55 @@ def vis_stage2_top10_map():
     dy = (maxy - miny) * 0.05
     ax.set_xlim(minx - dx, maxx + dx)
     ax.set_ylim(miny - dy, maxy + dy)
+    ax.set_aspect("equal", "box")
+    ax.set_anchor("C")
 
     # -------------------------------------------------------------------------
     # 7) Title, legend, and summary table text
     # -------------------------------------------------------------------------
-    ax.set_title(
-        "Top 10 Critical Substations (Impact Centrality)",
-        fontsize=20,
-        pad=10,
-    )
     ax.set_axis_off()
 
-    leg = ax.legend(loc="upper right", frameon=True, fontsize=11)
-    frame = leg.get_frame()
-    frame.set_facecolor("white")
-    frame.set_edgecolor("#cccccc")
-    frame.set_linewidth(1.2)
-    frame.set_alpha(0.95)
+    handles, labels = ax.get_legend_handles_labels()
+    dedup_handles = []
+    dedup_labels = []
+    seen_labels = set()
+    for handle, label in zip(handles, labels):
+        if label in {"Substations", "Top 10 by impact centrality"} and label not in seen_labels:
+            dedup_handles.append(handle)
+            dedup_labels.append(label)
+            seen_labels.add(label)
 
-    table_text = "rank  id          impact\n"
-    for _, row in top10.iterrows():
-        impact_str = f"{row['impact_centrality']:.2f}"
-        table_text += f"{row['rank']:<5} {str(row['join_key']):<11} {impact_str}\n"
-
-    plt.text(
-        0.02,
-        0.02,
-        table_text,
-        transform=ax.transAxes,
-        family="monospace",
-        fontsize=9,
-        va="bottom",
-        ha="left",
-        bbox=dict(
-            boxstyle="round,pad=0.4",
-            fc="white",
-            ec="#cccccc",
-            alpha=0.95,
-        ),
-    )
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.985, bottom=0.055)
+    if dedup_handles:
+        legend = ax.legend(
+            handles=dedup_handles,
+            labels=dedup_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.025),
+            ncol=2,
+            frameon=False,
+            borderpad=0.12,
+            labelspacing=0.18,
+            handletextpad=0.3,
+            columnspacing=0.7,
+            handlelength=1.1,
+            markerscale=0.8,
+            borderaxespad=0.0,
+        )
+        format_legend(legend)
 
     # -------------------------------------------------------------------------
     # 8) Save
     # -------------------------------------------------------------------------
     out_path = os.path.join(stage_dir, "vis_stage2_top10_map.png")
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, out_path)
     print(f"  -> Saved: {out_path}")
 
 def vis_stage2():
+    """Generate the full Stage 2 figure suite and exploratory diagnostics."""
     stage_dir = os.path.join(OUTPUT_ROOT, "Stage 2 Output")
-    if not ensure_dir(stage_dir):
+    if not os.path.exists(stage_dir):
+        print(f"  [Warning] Directory not found: {stage_dir}")
         return
 
     print("--- Visualizing Stage 2 (2.5) ---")
@@ -939,68 +1510,6 @@ def vis_stage2():
     # ------------------------------------------------------------------
     vis_stage2_top10_map()
     vis_stage2_topology_with_tracts_latlon()
-
-    # ------------------------------------------------------------------
-    # Helpers (local to Stage 2 visualization)
-    # ------------------------------------------------------------------
-    def choose_x_axis(df: pd.DataFrame, fallback_col: str) -> str:
-        """Choose a robust x-axis column; otherwise create a normalized fallback."""
-        if "fraction_removed" in df.columns:
-            return "fraction_removed"
-        if "nodes_removed" in df.columns:
-            return "nodes_removed"
-
-        df[fallback_col] = np.arange(len(df)) / max(len(df) - 1, 1)
-        return fallback_col
-
-    def is_coord_like(colname: str) -> bool:
-        """Match only when the entire col or underscore-bound variants indicate coordinates."""
-        cl = colname.lower()
-        coord_keywords = [
-            "lat", "lon", "latitude", "longitude",
-            "xcoord", "ycoord", "x_coord", "y_coord",
-        ]
-        return any(
-            cl == kw or cl.endswith("_" + kw) or cl.startswith(kw + "_")
-            for kw in coord_keywords
-        )
-
-    def detect_id_col(df: pd.DataFrame) -> str:
-        """Heuristically find a substation id column; fallback to the first column."""
-        for c in df.columns:
-            cl = c.lower()
-            if "substation" in cl and "id" in cl:
-                return c
-        return df.columns[0]
-
-    def detect_centrality_metrics(df: pd.DataFrame, id_col: str) -> list[str]:
-        """Auto-discover centrality-like numeric columns, excluding ID and coordinate fields."""
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-
-        blacklist = {id_col}
-        for c in df.columns:
-            if is_coord_like(c):
-                blacklist.add(c)
-
-        auto_metrics = []
-        for c in numeric_cols:
-            if c in blacklist:
-                continue
-
-            cl = c.lower()
-            if (
-                "centrality" in cl
-                or c in [
-                    "degree",
-                    "impact_centrality",
-                    "impact_population",
-                    "lambda2_impact",
-                    "closeness_centrality",
-                ]
-            ):
-                auto_metrics.append(c)
-
-        return sorted(set(auto_metrics))
 
     # ------------------------------------------------------------------
     # 1) Percolation curves: render each percolation_curve_*.csv
@@ -1020,13 +1529,24 @@ def vis_stage2():
             print(f"[Stage2 vis] {fname} missing lcc_fraction, skip.")
             continue
 
-        x_col = choose_x_axis(dfp, fallback_col="_fraction_removed_fallback")
+        x_col = _stage2_choose_x_axis(dfp, fallback_col="_fraction_removed_fallback")
 
-        fig, ax = plt.subplots(figsize=(8, 6))
+        fig, ax = plt.subplots(figsize=get_figsize("PANEL_FULLROW"))
         ax.plot(dfp[x_col], dfp["lcc_fraction"], "o-", markersize=4)
-        ax.set_title(f"Percolation Analysis ({fname.replace('.csv', '')})")
-        ax.set_ylabel("LCC Fraction")
-        ax.set_xlabel(x_col)
+        strategy_key = fname.replace(".csv", "").replace("percolation_curve_", "")
+        if strategy_key == "impact":
+            panel_title = "Impact-targeted removal"
+        elif strategy_key == "random":
+            panel_title = "Random removal"
+        else:
+            panel_title = strategy_key.replace("_", " ").title()
+
+        style_axis(
+            ax,
+            title=panel_title,
+            xlabel="Number of substations removed",
+            ylabel="Largest connected component fraction",
+        )
         save_plot(fig, stage_dir, f"vis_stage2_{fname.replace('.csv', '')}.png")
 
     # ------------------------------------------------------------------
@@ -1039,17 +1559,18 @@ def vis_stage2():
         df_imp = pd.read_csv(impact_csv)
         df_rand = pd.read_csv(rand_csv)
 
-        x_imp_col = choose_x_axis(df_imp, fallback_col="_x_fallback")
-        x_rand_col = choose_x_axis(df_rand, fallback_col="_x_fallback")
+        x_imp_col = _stage2_choose_x_axis(df_imp, fallback_col="_x_fallback")
+        x_rand_col = _stage2_choose_x_axis(df_rand, fallback_col="_x_fallback")
 
-        fig, ax = plt.subplots(figsize=(8, 6))
+        fig, ax = plt.subplots(figsize=get_figsize("PANEL_FULLROW"))
         ax.plot(
             df_imp[x_imp_col],
             df_imp["lcc_fraction"],
             marker="o",
             markersize=4,
             linestyle="-",
-            label="Impact (λ2-targeted)",
+            color="#b22222",
+            label="Impact λ2-targeted",
         )
         ax.plot(
             df_rand[x_rand_col],
@@ -1057,12 +1578,22 @@ def vis_stage2():
             marker="s",
             markersize=4,
             linestyle="--",
-            label="Random",
+            color="#7f7f7f",
+            label="Random baseline",
         )
-        ax.set_ylabel("LCC Fraction")
-        ax.set_xlabel(x_imp_col)
-        ax.set_title("Percolation Comparison: Impact vs Random")
-        ax.legend()
+        style_axis(
+            ax,
+            xlabel="Number of substations removed",
+            ylabel="Largest connected component fraction",
+        )
+        ax.set_ylabel("Largest connected\ncomponent fraction")
+        ax.yaxis.labelpad = 6
+        format_legend(
+            ax.legend(
+                frameon=False,
+            )
+        )
+        fig.subplots_adjust(left=0.17, right=0.985, top=0.965, bottom=0.16)
         save_plot(fig, stage_dir, "vis_stage2_percolation_compare_impact_vs_random.png")
 
     # ------------------------------------------------------------------
@@ -1074,9 +1605,9 @@ def vis_stage2():
         return
 
     df = pd.read_csv(cent_file)
-    id_col = detect_id_col(df)
-
-    valid_metrics = detect_centrality_metrics(df, id_col=id_col)
+    id_col = _stage2_detect_id_col(df)
+    df[id_col] = df[id_col].astype(str).str.strip().str.replace(".0", "", regex=False)
+    valid_metrics = _stage2_detect_metrics(df, id_col=id_col)
     if not valid_metrics:
         print("[Stage2 vis] no valid centrality columns found.")
         return
@@ -1085,11 +1616,9 @@ def vis_stage2():
 
     # 2.1) Distributions (hist)
     for m in valid_metrics:
-        fig, ax = plt.subplots(figsize=(8, 5))
+        fig, ax = plt.subplots(figsize=get_figsize("PANEL_HALF"))
         ax.hist(df[m].dropna().values, bins=40)
-        ax.set_title(f"Distribution of {m}")
-        ax.set_xlabel(m)
-        ax.set_ylabel("Count")
+        style_axis(ax, title=m, xlabel=m, ylabel="Count")
         save_plot(fig, stage_dir, f"vis_stage2_dist_{m}.png")
 
     # 2.2-a) Scatter: impact_centrality vs others
@@ -1097,11 +1626,9 @@ def vis_stage2():
         for m in valid_metrics:
             if m == "impact_centrality":
                 continue
-            fig, ax = plt.subplots(figsize=(6.5, 6))
+            fig, ax = plt.subplots(figsize=get_figsize("PANEL_HALF"))
             ax.scatter(df[m], df["impact_centrality"], alpha=0.4, s=12)
-            ax.set_xlabel(m)
-            ax.set_ylabel("impact_centrality")
-            ax.set_title(f"impact_centrality vs {m}")
+            style_axis(ax, title=f"{m} vs impact_centrality", xlabel=m, ylabel="impact_centrality")
             save_plot(fig, stage_dir, f"vis_stage2_scatter_impact_vs_{m}.png")
 
     # 2.2-b) Scatter: impact_population vs others
@@ -1109,12 +1636,50 @@ def vis_stage2():
         for m in valid_metrics:
             if m == "impact_population":
                 continue
-            fig, ax = plt.subplots(figsize=(6.5, 6))
+            fig, ax = plt.subplots(figsize=get_figsize("PANEL_HALF"))
             ax.scatter(df[m], df["impact_population"], alpha=0.4, s=12)
-            ax.set_xlabel(m)
-            ax.set_ylabel("impact_population")
-            ax.set_title(f"impact_population vs {m}")
+            style_axis(ax, title=f"{m} vs impact_population", xlabel=m, ylabel="impact_population")
             save_plot(fig, stage_dir, f"vis_stage2_scatter_impopp_vs_{m}.png")
+
+    if {"impact_centrality", "impact_population"}.issubset(df.columns):
+        primary = df[[id_col, "impact_population", "impact_centrality"]].copy()
+        primary["impact_population"] = pd.to_numeric(primary["impact_population"], errors="coerce")
+        primary["impact_centrality"] = pd.to_numeric(primary["impact_centrality"], errors="coerce")
+        primary = primary[
+            np.isfinite(primary["impact_population"]) & np.isfinite(primary["impact_centrality"])
+        ].copy()
+
+        if not primary.empty:
+            pearson_r = primary["impact_population"].corr(primary["impact_centrality"])
+            spearman_r = primary["impact_population"].rank().corr(primary["impact_centrality"].rank())
+
+            fig, ax = plt.subplots(figsize=get_figsize("PANEL_ASYM_LEFT"))
+            sns.regplot(
+                data=primary,
+                x="impact_population",
+                y="impact_centrality",
+                scatter_kws={"alpha": 0.55, "s": 18, "color": "#2f5d7e"},
+                line_kws={"color": "#b22222", "linewidth": 1.3},
+                ci=None,
+                ax=ax,
+            )
+            ax.text(
+                0.03,
+                0.97,
+                f"Pearson r = {pearson_r:.2f}\nSpearman rho = {spearman_r:.2f}",
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=FS_ANNOTATION,
+                bbox={"facecolor": "white", "edgecolor": "#c8c8c8", "alpha": 0.92, "boxstyle": "round,pad=0.25"},
+            )
+            style_axis(
+                ax,
+                title="Impact vs impact population",
+                xlabel="Impact population",
+                ylabel="Impact (lambda2-based)",
+            )
+            save_plot(fig, stage_dir, "vis_stage2_primary_impact_vs_impact_population.png")
 
     # 2.3) Top10 for each metric
     for m in valid_metrics:
@@ -1122,13 +1687,10 @@ def vis_stage2():
         top10[id_col] = top10[id_col].astype(str)
         top10 = top10.sort_values(m, ascending=False)
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=get_figsize("PANEL_ASYM_LEFT"))
         sns.barplot(data=top10, x=id_col, y=m, ax=ax, errorbar=None)
 
-        ax.set_title(f"Top 10 Substations by {m}")
-        ax.set_xlabel(id_col)
-        ax.set_ylabel(m)
-        ax.tick_params(axis="x", labelrotation=45)
+        style_axis(ax, title=m, xlabel=id_col, ylabel=m, xrotation=45)
         for lab in ax.get_xticklabels():
             lab.set_horizontalalignment("right")
 
@@ -1152,7 +1714,13 @@ def vis_stage2():
         mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
 
         n = corr.shape[0]
-        fig, ax = plt.subplots(figsize=(max(6.5, 0.85 * n), max(5.5, 0.85 * n)))
+        fig, ax = plt.subplots(
+            figsize=get_figsize(
+                "PANEL_ASYM_LEFT",
+                width_cm=max(PANEL_ASYM_LEFT["width_cm"], 2.3 * n),
+                height_cm=max(PANEL_ASYM_LEFT["height_cm"], 2.0 * n),
+            )
+        )
 
         sns.heatmap(
             corr,
@@ -1169,14 +1737,69 @@ def vis_stage2():
             cbar_kws={"shrink": 0.85, "label": "Correlation (Pearson r)"},
             ax=ax,
         )
+        style_colorbar(ax.collections[0].colorbar)
 
-        ax.set_title("Centrality Metric Correlations")
-        ax.tick_params(axis="x", labelrotation=45)
+        style_axis(ax, title="Centrality correlations (auxiliary)", xrotation=45, yrotation=0)
         for lab in ax.get_xticklabels():
             lab.set_horizontalalignment("right")
-        ax.tick_params(axis="y", labelrotation=0)
 
-        save_plot(fig, stage_dir, "vis_stage2_centrality_corr_heatmap.png")
+        save_plot(fig, stage_dir, "vis_stage2_centrality_corr_heatmap_aux.png")
+
+    curves, exploratory_metrics = _build_stage2_exploratory_curves(stage_dir, df, id_col, valid_metrics)
+    if curves and os.path.exists(impact_csv) and os.path.exists(rand_csv):
+        style_map = {
+            "random": {"color": "#7f7f7f", "linestyle": "--", "marker": "s", "label": "Random baseline"},
+            "impact": {"color": "#b22222", "linestyle": "-", "marker": "o", "label": "Impact λ2-targeted"},
+            "degree": {"color": "#2ca25f", "linestyle": "-", "marker": "^", "label": "Degree-targeted"},
+            "betweenness_centrality": {"color": "#d95f0e", "linestyle": "-", "marker": "D", "label": "Betweenness-targeted"},
+            "closeness_centrality": {"color": "#3182bd", "linestyle": "-", "marker": "v", "label": "Closeness-targeted"},
+            "eigenvector_centrality": {"color": "#756bb1", "linestyle": "-", "marker": "P", "label": "Eigenvector-targeted"},
+        }
+
+        fig, ax = plt.subplots(figsize=get_figsize("PANEL_FULLROW"))
+        base_curves = {
+            "impact": pd.read_csv(impact_csv),
+            "random": pd.read_csv(rand_csv),
+        }
+        for key, curve_df in base_curves.items():
+            x_col = _stage2_choose_x_axis(curve_df, fallback_col=f"_{key}_fallback")
+            spec = style_map[key]
+            ax.plot(
+                curve_df[x_col],
+                curve_df["lcc_fraction"],
+                color=spec["color"],
+                linestyle=spec["linestyle"],
+                marker=spec["marker"],
+                linewidth=1.3,
+                markersize=3.8,
+                label=spec["label"],
+            )
+
+        for metric in exploratory_metrics:
+            curve_df = curves[metric]
+            spec = style_map.get(metric, {"color": "#444444", "linestyle": "-", "marker": "o", "label": metric})
+            ax.plot(
+                curve_df["nodes_removed"],
+                curve_df["lcc_fraction"],
+                color=spec["color"],
+                linestyle=spec["linestyle"],
+                marker=spec["marker"],
+                linewidth=1.2,
+                markersize=3.5,
+                alpha=0.95,
+                label=spec["label"],
+            )
+
+        style_axis(
+            ax,
+            xlabel="Number of substations removed",
+            ylabel="Largest connected component fraction",
+        )
+        ax.set_ylabel("Largest connected\ncomponent fraction")
+        ax.yaxis.labelpad = 6
+        format_legend(ax.legend(frameon=False, ncol=2))
+        fig.subplots_adjust(left=0.17, right=0.985, top=0.965, bottom=0.16)
+        save_plot(fig, stage_dir, "vis_stage2_percolation_compare_targeted_attacks.png")
 
 
 # ==============================================================================
@@ -1186,74 +1809,123 @@ TIME_LIMIT_HR = 240.0
 
 
 # ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
-def save_plot(fig, folder: str, filename: str) -> None:
-    out_path = os.path.join(folder, filename)
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  -> Saved: {filename}")
-
-
-# ------------------------------------------------------------------------------
 # Stage 3 Visualization
 # ------------------------------------------------------------------------------
+def _stage3_fixed_bins(values: pd.Series, bin_width: float = 0.1):
+    """Build explicit histogram bin edges aligned to a fixed width."""
+    series = pd.to_numeric(values, errors="coerce")
+    series = series[np.isfinite(series)]
+    if series.empty:
+        return None
+
+    lower = np.floor(series.min() / bin_width) * bin_width
+    upper = np.ceil(series.max() / bin_width) * bin_width
+    if np.isclose(lower, upper):
+        upper = lower + bin_width
+
+    return np.arange(lower, upper + bin_width, bin_width)
+
+
+def _stage3_get_main_kpi_file(stage_dir: str, scenario: str) -> str | None:
+    """I/O adaptation only: Stage 3 main plots stay on the current gated/main KPI file."""
+    candidate = os.path.join(stage_dir, f"tract_kpis_{scenario}.csv")
+    return candidate if os.path.exists(candidate) else None
+
+
+def _stage3_get_raw_kpi_file(stage_dir: str, scenario: str) -> str | None:
+    """I/O adaptation only: raw baseline stays explicit and never replaces Stage 3 main input."""
+    candidate = os.path.join(stage_dir, f"tract_kpis_raw_{scenario}.csv")
+    return candidate if os.path.exists(candidate) else None
+
+
+def _stage3_metric_label(metric: str) -> str:
+    """Map raw Stage 3 KPI names to manuscript-facing labels."""
+    if metric == "T50":
+        return "T50 (hr)"
+    if metric == "T80":
+        return "T80 (hr)"
+    return metric
+
+
+def _stage3_auc_display_limits(values: pd.Series) -> tuple[float | None, float | None]:
+    """Estimate a robust AUC display range for Stage 3 map panels."""
+    auc = pd.to_numeric(values, errors="coerce")
+    auc = auc[np.isfinite(auc)]
+    if auc.empty:
+        return None, None
+
+    lo = float(auc.quantile(0.02))
+    hi = float(auc.quantile(0.98))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        lo = float(auc.min())
+        hi = float(auc.max())
+
+    if hi - lo < 1e-6:
+        center = float(auc.median())
+        pad = max(1e-3, abs(center) * 0.005)
+        return center - pad, center + pad
+
+    pad = max((hi - lo) * 0.04, 5e-4)
+    return lo - pad, hi + pad
+
+
 def vis_stage3(gdf):
+    """Produce Stage 3 tract KPI maps and distribution panels for each scenario."""
     stage_dir = os.path.join(OUTPUT_ROOT, "Stage 3 Output")
-    if not ensure_dir(stage_dir):
+    if not os.path.exists(stage_dir):
+        print(f"  [Warning] Directory not found: {stage_dir}")
         return
 
     print("--- Visualizing Stage 3 ---")
+    apply_publication_style()
 
     for scen in SCENARIOS:
         # Tract KPIs (Map + Hist)
-        kpi_file = os.path.join(stage_dir, f"tract_kpis_{scen}.csv")
-        if os.path.exists(kpi_file):
+        kpi_file = _stage3_get_main_kpi_file(stage_dir, scen)
+        if kpi_file is not None:
             df = pd.read_csv(kpi_file)
 
             # Rename first column to tract_id (as you had)
             df.rename(columns={df.columns[0]: "tract_id"}, inplace=True)
             df["tract_id"] = df["tract_id"].astype(str).str.split(".").str[0]
 
-            for metric in ["T50", "AUC"]:
+            for metric in ["T50", "T80", "AUC"]:
                 if metric not in df.columns:
                     continue
 
-                # Map
+                metric_label = _stage3_metric_label(metric)
                 if metric == "AUC":
                     c_map = "RdBu"
-                    v_min = 0.0     
-                    v_max = 1.0     
-                elif metric == "T50":
-    
-                    c_map = "RdBu_r" 
-                    v_min = None 
-                    v_max = None
+                    v_min, v_max = _stage3_auc_display_limits(df[metric])
                 else:
-                    c_map = "viridis"
+                    c_map = "RdBu_r"
                     v_min = None
                     v_max = None
 
-                # Map
                 plot_map(
                     gdf=gdf,
                     data_series=df.set_index("tract_id")[metric],
-                    title=f"{metric} Map - {scen}",
+                    title=f"{metric_label}: {scen}",
                     output_dir=stage_dir,
-                    filename=f"map_{metric}_{scen}.png",
+                    filename=f"vis_stage3_map_{metric}_{scen}.png",
                     cmap=c_map,
-                    label=metric,
+                    label=metric_label,
                     vmin=v_min,
                     vmax=v_max,
                     cmap_low=0.0,
                     cmap_high=1.0,
+                    figure_role="PANEL_MAP_TALL",
                 )
 
                 # Histogram + KDE
-                fig, ax = plt.subplots(figsize=(8, 5))
-                sns.histplot(df[metric], bins=30, kde=True, ax=ax)
-                ax.set_title(f"{metric} Distribution across Tracts - {scen}")
-                save_plot(fig, stage_dir, f"hist_{metric}_{scen}.png")
+                fig, ax = plt.subplots(figsize=get_figsize("PANEL_ASYM_LEFT"))
+                if metric in {"T50", "T80"}:
+                    bins = _stage3_fixed_bins(df[metric], bin_width=0.1)
+                    sns.histplot(df[metric], bins=bins, kde=True, ax=ax)
+                else:
+                    sns.histplot(df[metric], bins=30, kde=True, ax=ax)
+                style_axis(ax, title=scen, xlabel=metric_label, ylabel="Count")
+                save_plot(fig, stage_dir, f"vis_stage3_hist_{metric}_{scen}.png")
 
 # ==============================================================================
 # 4️⃣ Stage 4: Strategy Comparison
@@ -1273,14 +1945,114 @@ TIME_LIMIT_HR = 240.0
 # Legend order (single source of truth)
 LEGEND_ORDER = [
     "Theoretical Limit (Unconstrained)",
-    "Impact λ2-First (Grid Topology)",
-    "Impact-First (Population)",
+    "Impact λ2 (Grid Topology) First",
+    "Impact (Population) First",
     "Betweenness-First (Bridges)",
     "Degree-First (Hubs)",
     "Closeness-First (Accessibility)",
     "Hospital-First (Critical Nodes)",
-    "Baseline (Random)",
+    "Random Baseline",
 ]
+
+STAGE6_TOPOLOGY_LEGEND_ORDER = [
+    "Theoretical Limit",
+    "Impact lambda2 (Grid Topology) First",
+    "Betweenness First (Bridges)",
+    "Impact (Population) First",
+    "Degree First (Hubs)",
+    "Closeness First (Accessibility)",
+    "Hospital First (Critical Nodes)",
+    "Random Baseline",
+    "GA (Balanced)",
+    "GA (HospitalFirst)",
+    "GA (Efficiency)",
+]
+
+SHORT_STRATEGY_DISPLAY_ORDER = [
+    "Theoretical Limit",
+    "Betweenness First",
+    "Impact lambda2 First",
+    "Closeness-First",
+    "Degree First",
+    "Hospital Priority",
+    "Impact (Population) First",
+    "Random Baseline",
+    "GA (Balanced)",
+    "GA (Efficiency)",
+    "GA (HospitalFirst)",
+    "GA (Optimized)",
+]
+
+STAGE6_EQUITY_DISPLAY_ORDER = [
+    "Theoretical Limit",
+    "Betweenness First",
+    "Impact (\u03bb2) First",
+    "Closeness First",
+    "Degree First",
+    "Hospital Priority",
+    "Impact (Population) First",
+    "Random Baseline",
+    "GA (Balanced)",
+    "GA (Efficiency)",
+    "GA (HospitalFirst)",
+    "GA (Optimized)",
+]
+
+
+def short_strategy_display_name(name: str) -> str:
+    """Map raw strategy/rule names to shared manuscript-friendly short labels."""
+    s = str(name).strip()
+    lower = s.lower()
+
+    if ("theoretical" in lower) or ("unconstrained" in lower) or ("s3_mean" in lower) or lower.startswith("stage3"):
+        return "Theoretical Limit"
+    if "betweenness-first" in lower or "betweenness" in lower:
+        return "Betweenness First"
+    if ("centrality-first" in lower) or ("lambda2" in lower):
+        return "Impact lambda2 First"
+    if "closeness-first" in lower or "closeness" in lower:
+        return "Closeness-First"
+    if "degree-first" in lower or lower == "degree":
+        return "Degree First"
+    if ("hospital-first" in lower) and ("ga" not in lower):
+        return "Hospital Priority"
+    if "impact-first" in lower:
+        return "Impact (Population) First"
+    if "random" in lower:
+        return "Random Baseline"
+    if ("ga_best" in lower) or (("optimized" in lower) and ("ga" in lower)):
+        return "GA (Optimized)"
+    if ("ga_balanced" in lower) or (("balanced" in lower) and ("ga" in lower)):
+        return "GA (Balanced)"
+    if ("ga_efficiency" in lower) or (("efficiency" in lower) and ("ga" in lower)):
+        return "GA (Efficiency)"
+    if ("ga_hospfirst" in lower) or (("hospitalfirst" in lower) and ("ga" in lower)) or ((("hospfirst" in lower) or ("hospital" in lower)) and ("ga" in lower)):
+        return "GA (HospitalFirst)"
+    return s
+
+
+def stage4_kpi_display_name(name: str) -> str:
+    """Stage 4 KPI figures use a slightly different short label set."""
+    s = str(name).strip()
+    lower = s.lower()
+
+    if ("centrality-first" in lower) or ("lambda2" in lower):
+        return "Impact (λ2) First"
+    if "closeness-first" in lower or "closeness" in lower:
+        return "Closeness First"
+    return short_strategy_display_name(s)
+
+
+def stage6_equity_display_name(name: str) -> str:
+    """Stage 6 equity figures use slightly different manuscript labels."""
+    s = str(name).strip()
+    lower = s.lower()
+
+    if ("centrality-first" in lower) or ("lambda2" in lower):
+        return "Impact (\u03bb2) First"
+    if "closeness-first" in lower or "closeness" in lower:
+        return "Closeness First"
+    return short_strategy_display_name(s)
 
 
 def _ordered_legend(ax):
@@ -1321,7 +2093,13 @@ def _safe_lcc_fraction(df: pd.DataFrame):
 
     return None
 
-def plot_gantt_chart(df: pd.DataFrame, output_dir: str, title_suffix: str, max_crews: int = 50) -> None:
+def plot_gantt_chart(
+    df: pd.DataFrame,
+    output_dir: str,
+    title_suffix: str,
+    max_crews: int = 50,
+    stage_label: str | None = None,
+) -> None:
     """
     Generic function to plot Crew Schedule Gantt Charts.
     - Red bars: Travel time
@@ -1339,12 +2117,22 @@ def plot_gantt_chart(df: pd.DataFrame, output_dir: str, title_suffix: str, max_c
         df = df[df["Crew_ID"].isin(subset_crews)].copy()
 
     # Dynamic figure height
-    fig_height = max(6, len(df["Crew_ID"].unique()) * 0.5)
-    fig, ax = plt.subplots(figsize=(16, fig_height))
+    fig_height_cm = max(PANEL_GANTT["height_cm"], 0.55 * len(df["Crew_ID"].unique()) + 5.0)
+    fig, ax = plt.subplots(
+        figsize=get_figsize("PANEL_GANTT", height_cm=fig_height_cm)
+    )
 
     # 2. Map Crew IDs to Y-axis positions
     crews = sorted(df["Crew_ID"].unique())
     y_map = {c: i for i, c in enumerate(crews)}
+
+    def _display_crew_label(crew_id):
+        """Format crew identifiers as human-readable labels for the Gantt y-axis."""
+        try:
+            crew_num = int(float(crew_id))
+            return f"Crew {crew_num + 1}" if crew_num >= 0 else f"Crew {crew_num}"
+        except Exception:
+            return f"Crew {crew_id}"
 
     # 3. Plot Bars
     added_label_repair = False
@@ -1375,11 +2163,22 @@ def plot_gantt_chart(df: pd.DataFrame, output_dir: str, title_suffix: str, max_c
         added_label_repair = True
 
     # 4. Formatting
+    display_title = (
+        str(title_suffix)
+        .replace("Stage5_GA_", "")
+        .replace("Stage4_", "")
+        .replace("_", " ")
+    )
+
     ax.set_yticks(list(y_map.values()))
-    ax.set_yticklabels([f"Crew {c}" for c in y_map.keys()], fontsize=9)
-    ax.set_xlabel("Time (Hours) Since Event")
-    ax.set_ylabel("Maintenance Crews")
-    ax.set_title(f"Crew Schedule Gantt Chart: {title_suffix}", fontsize=14, fontweight="bold")
+    ax.set_yticklabels([_display_crew_label(c) for c in crews], fontsize=FS_TICK)
+    ax.invert_yaxis()
+    style_axis(
+        ax,
+        title=display_title,
+        xlabel="Time (hours) since event",
+        ylabel="Maintenance crews",
+    )
     
     if not df.empty:
         max_end_time = (df["Start_Time"] + df["Duration"]).max()
@@ -1387,22 +2186,34 @@ def plot_gantt_chart(df: pd.DataFrame, output_dir: str, title_suffix: str, max_c
             ax.set_xlim(0, max_end_time * 1.05) 
 
     ax.grid(True, axis="x", linestyle="--", alpha=0.5)
-    ax.legend(
+    legend = ax.legend(
         loc="upper left", 
         bbox_to_anchor=(1.01, 1), 
         borderaxespad=0,
         frameon=True,
-        title="Task Type"
     )
+    format_legend(legend)
 
     # 5. Save
-    safe_name = title_suffix.replace(" ", "_").replace("/", "-").replace(":", "")
-    filename = f"vis_gantt_{safe_name}.png"
+    clean_name = (
+        str(title_suffix)
+        .replace("Stage5_GA_", "")
+        .replace("Stage4_", "")
+    )
+    safe_name = clean_name.replace(" ", "_").replace("/", "-").replace(":", "")
+    resolved_stage_label = stage_label
+    if not resolved_stage_label:
+        match = re.search(r"stage\s*([0-9]+)", os.path.basename(str(output_dir)), flags=re.IGNORECASE)
+        if match:
+            resolved_stage_label = f"stage{match.group(1)}"
+        else:
+            resolved_stage_label = "stage"
+    filename = f"vis_{resolved_stage_label}_gantt_{safe_name}.png"
     plt.tight_layout()
     save_plot(fig, output_dir, filename)
-    plt.close(fig)
 
 def vis_stage4():
+    """Generate Stage 4 scheduling comparison figures and crew-schedule Gantt charts."""
     stage4_dir = os.path.join(OUTPUT_ROOT, "Stage 4 Output")
     stage3_dir = os.path.join(OUTPUT_ROOT, "Stage 3 Output")
 
@@ -1413,11 +2224,7 @@ def vis_stage4():
     print("--- Visualizing Stage 4: Logistics, Topology & Efficiency ---")
 
     # Plot styling
-    try:
-        sns.set_style("whitegrid")
-        sns.set_context("talk", font_scale=1.05)
-    except Exception:
-        plt.style.use("ggplot")
+    apply_publication_style()
 
     # Style map for rule curves
     style_map = {
@@ -1465,6 +2272,16 @@ def vis_stage4():
         },
     }
 
+    def _stage4_get_main_pop_kpi_file(scenario: str) -> str | None:
+        """I/O adaptation only: prefer the current main/gated Stage 4 KPI export."""
+        # rule_kpis_system_{scenario}.csv is a legacy name and is no longer a
+        # valid input for the current main output.
+        main_path = os.path.join(stage4_dir, f"rule_kpis_pop_{scenario}.csv")
+        if os.path.exists(main_path):
+            return main_path
+
+        return None
+
     # ==================================================================
     # PART 1: Logistics Heatmaps
     # ==================================================================
@@ -1476,7 +2293,7 @@ def vis_stage4():
             df_base_task = pd.read_csv(base_to_task_file, index_col=0)
             df_plot = df_base_task.replace([np.inf, -np.inf], np.nan)
 
-            fig, ax = plt.subplots(figsize=(12, 10))
+            fig, ax = plt.subplots(figsize=get_figsize("COMPOSITE_MEDIUM"))
             sns.heatmap(
                 df_plot,
                 mask=df_plot.isna(),
@@ -1486,18 +2303,16 @@ def vis_stage4():
                 yticklabels=False,
                 ax=ax,
             )
-            ax.set_title(
-                "Logistics Constraint: Base-to-Task Travel Time (Full Network)",
-                fontweight="bold",
-                fontsize=24,
-                pad=10,
+            style_colorbar(ax.collections[0].colorbar)
+            style_axis(
+                ax,
+                title="Base-to-task",
+                xlabel=f"Destination substation ID (N={df_plot.shape[1]})",
+                ylabel=f"Origin base ID (N={df_plot.shape[0]})",
             )
-            ax.set_xlabel(f"Destination Substation ID (N={df_plot.shape[1]})", fontsize=22)
-            ax.set_ylabel(f"Origin Base ID (N={df_plot.shape[0]})", fontsize=22)
 
             out_path = os.path.join(stage4_dir, "vis_stage4_logistics_heatmap_base_to_task_full.png")
-            plt.savefig(out_path, dpi=300, bbox_inches="tight")
-            plt.close(fig)
+            save_figure(fig, out_path)
             print(f"  -> Saved Heatmap: {out_path}")
         except Exception as e:
             print(f"  -> Failed to plot base-to-task heatmap: {e}")
@@ -1510,7 +2325,7 @@ def vis_stage4():
             df_travel = pd.read_csv(task_matrix_file, index_col=0)
             df_plot = df_travel.replace([np.inf, -np.inf], np.nan)
 
-            fig, ax = plt.subplots(figsize=(12, 10))
+            fig, ax = plt.subplots(figsize=get_figsize("COMPOSITE_MEDIUM"))
             sns.heatmap(
                 df_plot,
                 mask=df_plot.isna(),
@@ -1520,18 +2335,16 @@ def vis_stage4():
                 yticklabels=False,
                 ax=ax,
             )
-            ax.set_title(
-                "Logistics Constraint: Task-to-Task Travel Time (Full Network)",
-                fontweight="bold",
-                fontsize=24,
-                pad=10,
+            style_colorbar(ax.collections[0].colorbar)
+            style_axis(
+                ax,
+                title="Task-to-task",
+                xlabel=f"Destination substation ID (N={df_plot.shape[1]})",
+                ylabel=f"Origin substation ID (N={df_plot.shape[0]})",
             )
-            ax.set_xlabel(f"Destination Substation ID (N={df_plot.shape[1]})", fontsize=22)
-            ax.set_ylabel(f"Origin Substation ID (N={df_plot.shape[0]})", fontsize=22)
 
             out_path = os.path.join(stage4_dir, "vis_stage4_logistics_heatmap_full.png")
-            plt.savefig(out_path, dpi=300, bbox_inches="tight")
-            plt.close(fig)
+            save_figure(fig, out_path)
             print(f"  -> Saved Heatmap: {out_path}")
         except Exception as e:
             print(f"  -> Failed to plot heatmap: {e}")
@@ -1544,20 +2357,19 @@ def vis_stage4():
     for scen in SCENARIOS:
         print(f"\nProcessing Scenario: {scen}...")
 
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        fig, axes = plt.subplots(1, 2, figsize=get_figsize("COMPOSITE_MEDIUM"))
         has_data = False
         x_candidates = []
 
         # ----------------------------------------------------------------------
         # KPI Efficiency Bar Chart
         # ----------------------------------------------------------------------
-        kpi_file = os.path.join(stage4_dir, f"rule_kpis_pop_{scen}.csv")
-        if not os.path.exists(kpi_file):
-            kpi_file = os.path.join(stage4_dir, f"rule_kpis_system_{scen}.csv")
-
-        if not os.path.exists(kpi_file):
-            # Fail silently or log info, but don't crash
-            # print(f"  [Info] KPI file missing for {scen} bar chart.")
+        kpi_file = _stage4_get_main_pop_kpi_file(scen)
+        if kpi_file is None:
+            print(
+                "  [Stage 4 Warning] Missing current main KPI file "
+                f"'rule_kpis_pop_{scen}.csv'; skipping KPI bar chart for {scen}."
+            )
             continue
 
         df_kpi = pd.read_csv(kpi_file)
@@ -1578,20 +2390,9 @@ def vis_stage4():
             continue
 
         rule_col = _detect_rule_col(df_kpi)
-        
-        # 3. Paper-Ready Naming Convention
-        display_map = {
-            "centrality-first":  "Impact (λ2)",
-            "impact-first":      "Impact (Pop)",
-            "betweenness-first": "Betweenness",
-            "degree-first":      "Degree Centrality",
-            "closeness-first":   "Closeness",
-            "hospital-first":    "Hospital Priority",
-            "random":            "Random (Baseline)",
-        }
-        
-        # Map names, fallback to original if not found
-        df_kpi["display_name"] = df_kpi[rule_col].astype(str).str.strip().map(display_map).fillna(df_kpi[rule_col])
+
+        # 3. Stage 4 manuscript-friendly strategy naming
+        df_kpi["display_name"] = df_kpi[rule_col].apply(stage4_kpi_display_name)
 
         # 4. Sorting: Fastest (Lowest T50) on Top
         #    We sort ascending, but plotting usually draws bottom-up, so we verify order below.
@@ -1613,7 +2414,10 @@ def vis_stage4():
         # 6. Plotting (Matplotlib OO Interface for precision)
         #    Dynamic height: 0.6 inches per bar + 1.5 inches for header/footer
         fig_h = max(3.5, len(df_plot) * 0.6 + 1.5)
-        fig, ax = plt.subplots(figsize=(8, fig_h))
+        fig_h_cm = max(PANEL_ASYM_LEFT["height_cm"], 1.55 * len(df_plot) + 3.0)
+        fig, ax = plt.subplots(
+            figsize=get_figsize("PANEL_ASYM_LEFT", height_cm=fig_h_cm)
+        )
 
         bars = ax.barh(
             y=df_plot.index, 
@@ -1636,9 +2440,12 @@ def vis_stage4():
 
         #    Labels
         ax.set_yticks(df_plot.index)
-        ax.set_yticklabels(df_plot["display_name"], fontsize=15, fontweight='medium')
-        ax.set_xlabel("Time to 50% System Recovery (Hours)", fontsize=15, color="#333333")
-        ax.set_title(f"Recovery Efficiency: {scen}", fontsize=18, fontweight="bold", loc="center", pad=15)
+        ax.set_yticklabels(df_plot["display_name"], fontsize=FS_TICK, fontweight="medium")
+        style_axis(
+            ax,
+            title=scen,
+            xlabel="Time to 50% system recovery (hours)",
+        )
 
         # 9. Direct Value Annotation (Right of Bar)
         max_val = df_plot["T50"].max()
@@ -1671,7 +2478,7 @@ def vis_stage4():
                 label_txt, 
                 va='center', 
                 ha='left', 
-                fontsize=15, 
+                fontsize=FS_ANNOTATION,
                 fontweight=weight,
                 color=txt_color
             )
@@ -1680,8 +2487,7 @@ def vis_stage4():
         plt.tight_layout()
         
         out_path = os.path.join(stage4_dir, f"vis_stage4_kpi_t50_{scen}.png")
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
+        save_figure(fig, out_path)
         print(f"  -> Saved [Pub-Quality] KPI Plot: {out_path}")
         
     # ==================================================================
@@ -1699,9 +2505,9 @@ def vis_stage4():
                 for strat in strategies:
                     sub_df = df_gantt[df_gantt["Stage"] == strat]
                     if not sub_df.empty:
-                        plot_gantt_chart(sub_df, stage4_dir, str(strat))
+                        plot_gantt_chart(sub_df, stage4_dir, str(strat), stage_label="stage4")
             else:
-                plot_gantt_chart(df_gantt, stage4_dir, "Stage4_All_Rules")
+                plot_gantt_chart(df_gantt, stage4_dir, "Stage4_All_Rules", stage_label="stage4")
 
         except Exception as e:
             print(f"  [Error] Failed to plot Stage 4 Gantt: {e}")
@@ -1727,6 +2533,7 @@ def vis_stage5():
             return
 
     print(f"--- Visualizing Stage 5 (GA Optimization) in {stage_dir} ---")
+    apply_publication_style()
 
     # 2. Find all schedule files matching the pattern
     search_pattern = os.path.join(stage_dir, "GA_Schedule_*.csv")
@@ -1776,7 +2583,7 @@ def vis_stage5():
 
             # 4. Generate Plot
             plot_title = f"Stage5_GA_{clean_name}"
-            plot_gantt_chart(df, stage_dir, plot_title)
+            plot_gantt_chart(df, stage_dir, plot_title, stage_label="stage5")
             print(f"    -> Plotted: {filename}")
 
         except Exception as e:
@@ -1791,6 +2598,476 @@ def vis_stage5():
 import matplotlib.patches as mpatches
 import matplotlib.lines as mlines
 
+STAGE6_SHARED_LINE_STYLES = {
+    "S3_Mean": {"color": "black", "ls": "--", "lw_recovery": 1.45, "lw_topology": 1.32, "alpha_recovery": 0.98, "alpha_topology": 0.92, "zorder": 11},
+    "centrality-first": {"color": "#e41a1c", "ls": "-.", "lw_recovery": 1.08, "lw_topology": 0.98, "alpha_recovery": 0.82, "alpha_topology": 0.80, "zorder": 6},
+    "betweenness-first": {"color": "#ffd92f", "ls": (0, (5.0, 1.5, 1.2, 1.5)), "lw_recovery": 1.05, "lw_topology": 0.95, "alpha_recovery": 0.82, "alpha_topology": 0.80, "zorder": 5},
+    "impact-first": {"color": "#ff7f00", "ls": ":", "lw_recovery": 1.12, "lw_topology": 1.00, "alpha_recovery": 0.82, "alpha_topology": 0.80, "zorder": 4},
+    "degree-first": {"color": "#4daf4a", "ls": "--", "lw_recovery": 1.05, "lw_topology": 0.95, "alpha_recovery": 0.82, "alpha_topology": 0.80, "zorder": 7},
+    "closeness-first": {"color": "#377eb8", "ls": (0, (4.0, 1.6)), "lw_recovery": 1.05, "lw_topology": 0.95, "alpha_recovery": 0.82, "alpha_topology": 0.80, "zorder": 8},
+    "hospital-first": {"color": "#555555", "ls": (0, (2.2, 1.4)), "lw_recovery": 1.02, "lw_topology": 0.92, "alpha_recovery": 0.82, "alpha_topology": 0.80, "zorder": 3},
+    "random": {"color": "lightgray", "ls": "-", "lw_recovery": 1.10, "lw_topology": 1.00, "alpha_recovery": 0.82, "alpha_topology": 0.78, "zorder": 1},
+    "GA_Balanced": {"color": "#6a3d9a", "ls": "-", "lw_recovery": 1.22, "lw_topology": 1.10, "alpha_recovery": 0.92, "alpha_topology": 0.88, "zorder": 10},
+    "GA_HospFirst": {"color": "#c51b7d", "ls": "-", "lw_recovery": 1.18, "lw_topology": 1.08, "alpha_recovery": 0.90, "alpha_topology": 0.86, "zorder": 9},
+    "GA_Efficiency": {"color": "#1b9e77", "ls": "-", "lw_recovery": 1.18, "lw_topology": 1.08, "alpha_recovery": 0.90, "alpha_topology": 0.86, "zorder": 9},
+    "GA_Best": {"color": "#6a3d9a", "ls": "-", "lw_recovery": 1.22, "lw_topology": 1.10, "alpha_recovery": 0.90, "alpha_topology": 0.86, "zorder": 10},
+}
+
+
+def _stage6_line_style(strategy_key: str, role: str = "recovery") -> dict:
+    """Return the shared Stage 6 line style for recovery/topology plots."""
+    base = STAGE6_SHARED_LINE_STYLES.get(strategy_key, STAGE6_SHARED_LINE_STYLES["random"])
+    linewidth_key = "lw_topology" if role == "topology" else "lw_recovery"
+    alpha_key = "alpha_topology" if role == "topology" else "alpha_recovery"
+    return {
+        "color": base["color"],
+        "ls": base["ls"],
+        "lw": base[linewidth_key],
+        "alpha": base[alpha_key],
+        "zorder": base["zorder"],
+    }
+
+STAGE6_RECOVERY_STYLE_CONFIG = {
+    "S3_Mean": {
+        "label": "Theoretical Limit",
+        "color": "black",
+        "ls": "--",
+        "lw": 1.35,
+        "alpha": 0.95,
+        "zorder": 11,
+    },
+    "centrality-first": {
+        "label": "Impact λ2 (Grid Topology) First",
+        "color": "#e41a1c",
+        "ls": "-.",
+        "lw": 1.05,
+        "alpha": 0.75,
+        "zorder": 6,
+    },
+    "betweenness-first": {
+        "label": "Betweenness First (Bridges)",
+        "color": "#ffd92f",
+        "ls": "-.",
+        "lw": 1.0,
+        "alpha": 0.75,
+        "zorder": 5,
+    },
+    "impact-first": {
+        "label": "Impact (Population) First",
+        "color": "#ff7f00",
+        "ls": ":",
+        "lw": 1.05,
+        "alpha": 0.75,
+        "zorder": 4,
+    },
+    "degree-first": {
+        "label": "Degree First (Hubs)",
+        "color": "#4daf4a",
+        "ls": "--",
+        "lw": 1.0,
+        "alpha": 0.75,
+        "zorder": 7,
+    },
+    "closeness-first": {
+        "label": "Closeness First (Accessibility)",
+        "color": "#377eb8",
+        "ls": "--",
+        "lw": 1.0,
+        "alpha": 0.75,
+        "zorder": 8,
+    },
+    "hospital-first": {
+        "label": "Hospital First (Critical Nodes)",
+        "color": "#555555",
+        "ls": "-",
+        "lw": 1.0,
+        "alpha": 0.65,
+        "zorder": 3,
+    },
+    "random": {
+        "label": "Random Baseline",
+        "color": "lightgray",
+        "ls": "-",
+        "lw": 0.95,
+        "alpha": 0.6,
+        "zorder": 1,
+    },
+    "GA_Balanced": {
+        "label": "GA (Balanced)",
+        "color": "#6a3d9a",
+        "ls": "-",
+        "lw": 1.15,
+        "alpha": 0.9,
+        "zorder": 10,
+    },
+    "GA_HospFirst": {
+        "label": "GA (HospitalFirst)",
+        "color": "#c51b7d",
+        "ls": "-",
+        "lw": 1.1,
+        "alpha": 0.85,
+        "zorder": 9,
+    },
+    "GA_Efficiency": {
+        "label": "GA (Efficiency)",
+        "color": "#1b9e77",
+        "ls": "-",
+        "lw": 1.1,
+        "alpha": 0.85,
+        "zorder": 9,
+    },
+    "GA_Best": {
+        "label": "GA Optimized",
+        "color": "#6a3d9a",
+        "ls": "-",
+        "lw": 1.15,
+        "alpha": 0.85,
+        "zorder": 10,
+    },
+}
+
+for _stage6_key in list(STAGE6_RECOVERY_STYLE_CONFIG.keys()):
+    STAGE6_RECOVERY_STYLE_CONFIG[_stage6_key].update(
+        _stage6_line_style(_stage6_key, role="recovery")
+    )
+
+
+def _stage6_get_main_curves_file(stage_dir: str) -> str | None:
+    """I/O adaptation only: Stage 6 main recovery curves stay on the current main/gated export."""
+    csv_path = os.path.join(stage_dir, "recovery_curves_all_system.csv")
+    return csv_path if os.path.exists(csv_path) else None
+
+
+def _stage6_get_raw_curves_file(stage_dir: str) -> str | None:
+    """I/O adaptation only: raw baseline curves stay supplementary and never replace the main input."""
+    csv_path = os.path.join(stage_dir, "recovery_curves_all_system_raw_baseline.csv")
+    return csv_path if os.path.exists(csv_path) else None
+
+
+def _stage6_get_main_kpis_file(stage_dir: str) -> str | None:
+    """I/O adaptation only: Stage 6 KPI main figures stay on the current main/gated export."""
+    csv_path = os.path.join(stage_dir, "recovery_kpis_all_system.csv")
+    return csv_path if os.path.exists(csv_path) else None
+
+
+def _stage6_get_raw_kpis_file(stage_dir: str) -> str | None:
+    """I/O adaptation only: raw baseline KPIs stay supplementary and never replace the main input."""
+    csv_path = os.path.join(stage_dir, "recovery_kpis_all_system_raw_baseline.csv")
+    return csv_path if os.path.exists(csv_path) else None
+
+
+def _stage6_load_recovery_kpis_csv(stage_dir: str, raw_baseline: bool = False):
+    """Load Stage 6 KPI tables without changing main-vs-raw semantics."""
+    csv_path = (
+        _stage6_get_raw_kpis_file(stage_dir)
+        if raw_baseline
+        else _stage6_get_main_kpis_file(stage_dir)
+    )
+    expected_name = (
+        "recovery_kpis_all_system_raw_baseline.csv"
+        if raw_baseline
+        else "recovery_kpis_all_system.csv"
+    )
+    if csv_path is None:
+        print(f"  [Stage 6] {expected_name} not found: {os.path.join(stage_dir, expected_name)}")
+        return None, None
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        print(f"  [Stage 6] Failed to read KPI CSV '{expected_name}': {e}")
+        return None, csv_path
+
+    return df, csv_path
+
+
+def _stage6_load_recovery_curves_csv(stage_dir: str, raw_baseline: bool = False):
+    """Load Stage 6 recovery curves while keeping main and raw-baseline semantics explicit."""
+    csv_path = (
+        _stage6_get_raw_curves_file(stage_dir)
+        if raw_baseline
+        else _stage6_get_main_curves_file(stage_dir)
+    )
+    expected_name = (
+        "recovery_curves_all_system_raw_baseline.csv"
+        if raw_baseline
+        else "recovery_curves_all_system.csv"
+    )
+    if csv_path is None:
+        print(f"  [Stage 6] {expected_name} not found: {os.path.join(stage_dir, expected_name)}")
+        return None, None, None
+
+    try:
+        df_curves = pd.read_csv(csv_path)
+    except Exception as e:
+        print(f"  [Stage 6] Failed to read recovery curves CSV: {e}")
+        return None, None, None
+
+    if df_curves.empty or "time_hr" not in df_curves.columns:
+        print("  [Stage 6] recovery curves CSV is empty or missing time_hr.")
+        return None, None, None
+
+    df_curves["time_hr"] = pd.to_numeric(df_curves["time_hr"], errors="coerce")
+    df_curves = df_curves[np.isfinite(df_curves["time_hr"])].copy()
+    if df_curves.empty:
+        print("  [Stage 6] recovery curves CSV has no valid time grid.")
+        return None, None, None
+
+    df_curves = df_curves.sort_values("time_hr").set_index("time_hr")
+    time_grid = pd.Index(df_curves.index.astype(float), name="time_hr")
+    return df_curves, time_grid, csv_path
+
+
+def _stage6_align_to_tgrid(series: pd.Series, time_grid: pd.Index):
+    """Align a recovery curve to the consolidated Stage 6 time grid."""
+    if series is None:
+        return None
+    try:
+        s = pd.Series(pd.to_numeric(series, errors="coerce"), index=series.index, name=series.name)
+        s = s.sort_index()
+        s = s.reindex(time_grid)
+        s = s.ffill().bfill()
+        return s
+    except Exception:
+        return series
+
+
+def _stage6_parse_curve_column(column_name: str):
+    """
+    Parse Stage 6 wide-format curve columns like:
+      Northridge_S4_centrality-first_Pop
+      Northridge_S3_Mean_SVI
+      Northridge_GA_Balanced_Pop
+      Northridge_S4_centrality-first_RawBaseline_Pop
+    """
+    col = str(column_name).strip()
+    if not col or col == "time_hr":
+        return None
+
+    if col.endswith("_Pop"):
+        weight_type = "Population"
+        core = col[:-4]
+    elif col.endswith("_SVI"):
+        weight_type = "SVI_Weighted"
+        core = col[:-4]
+    else:
+        return None
+
+    is_raw_baseline = False
+    if core.endswith("_RawBaseline"):
+        is_raw_baseline = True
+        core = core[: -len("_RawBaseline")]
+
+    scenario = None
+    raw_key = ""
+    for scen in sorted(SCENARIOS, key=len, reverse=True):
+        prefix = f"{scen}_"
+        if core.startswith(prefix):
+            scenario = scen
+            raw_key = core[len(prefix):]
+            break
+
+    if scenario is None or not raw_key:
+        return None
+
+    key = raw_key
+    if raw_key.startswith("S4_"):
+        key = raw_key[3:]
+    elif raw_key.startswith("Stage4_"):
+        key = raw_key[7:]
+    elif raw_key.startswith("Stage5_"):
+        key = raw_key[7:]
+    elif raw_key.startswith("Stage3_"):
+        key = raw_key.replace("Stage3_", "S3_", 1)
+
+    return scenario, key, weight_type, is_raw_baseline
+
+
+def _stage6_reconstruct_curve_dicts(
+    df_curves: pd.DataFrame,
+    time_grid: pd.Index,
+    raw_baseline: bool = False,
+):
+    """Rebuild per-scenario curve dictionaries from consolidated Stage 6 CSV tables.
+
+    The parser preserves the distinction between gated main results and
+    raw-baseline comparison curves so downstream plotting functions can
+    reconstruct the original scenario-by-scenario figure inputs without mixing
+    the two reporting modes.
+    """
+    curves_by_weight = {"Population": {}, "SVI_Weighted": {}}
+
+    for col in df_curves.columns:
+        parsed = _stage6_parse_curve_column(col)
+        if parsed is None:
+            continue
+
+        scenario, key, weight_type, is_raw_baseline = parsed
+        if is_raw_baseline != raw_baseline:
+            continue
+        if key not in STAGE6_RECOVERY_STYLE_CONFIG:
+            continue
+
+        series = pd.Series(
+            pd.to_numeric(df_curves[col], errors="coerce"),
+            index=time_grid,
+            name=key,
+        )
+        if series.notna().sum() == 0:
+            continue
+
+        aligned = _stage6_align_to_tgrid(series, time_grid)
+        curves_by_weight.setdefault(weight_type, {}).setdefault(scenario, {})[key] = aligned
+
+    return curves_by_weight
+
+
+def _stage6_adjust_curve_label(key: str, weight_type: str, base_label: str) -> str:
+    """Preserve the original Stage 6 recovery-curve legend wording."""
+    if weight_type == "SVI_Weighted":
+        if key == "impact-first":
+            return "Impact (Population) First (SVI)"
+        if key == "S3_Mean":
+            return "Theoretical Limit (SVI)"
+    return base_label
+
+
+def _stage6_adaptive_xlim(plotted_series: list[pd.Series], time_grid: pd.Index) -> float:
+    """Use the last unfinished recovery time to keep Stage 6 curve plots compact."""
+    max_time = min(TIME_LIMIT_HR, float(np.nanmax(time_grid.values)))
+    if not plotted_series:
+        return max_time
+
+    try:
+        df_plot = pd.concat(plotted_series, axis=1)
+        unfinished = df_plot < 0.999
+        if unfinished.any().any():
+            unfinished_idx = unfinished.any(axis=1)
+            last_t = float(unfinished_idx[unfinished_idx].index.max())
+            return min(max_time, last_t * 1.25)
+    except Exception:
+        pass
+
+    return max_time
+
+
+def _stage6_plot_single_scenario_recovery_curve(
+    scenario_name: str,
+    data_dict: dict[str, pd.Series],
+    weight_type: str,
+    stage_dir: str,
+    time_grid: pd.Index,
+) -> None:
+    """
+    Plot one Stage 6 system-recovery panel from reconstructed curve inputs.
+
+    Curves are drawn in ``STAGE6_RECOVERY_STYLE_CONFIG`` order so color, line
+    style, and legend ordering remain stable across scenarios and manuscript
+    exports.
+    """
+    if not data_dict:
+        return
+
+    fig, ax = plt.subplots(
+        figsize=get_figsize("PANEL_FULLROW", height_cm=7.0)
+    )
+
+    plotted_series = []
+    has_plotted = False
+
+    for key, style in STAGE6_RECOVERY_STYLE_CONFIG.items():
+        if key not in data_dict:
+            continue
+
+        series = _stage6_align_to_tgrid(data_dict[key], time_grid)
+        if series is None:
+            continue
+
+        plotted_series.append(series)
+        final_label = _stage6_adjust_curve_label(key, weight_type, style["label"])
+        ax.plot(
+            series.index,
+            series.values,
+            label=final_label,
+            color=style["color"],
+            linestyle=style["ls"],
+            linewidth=style["lw"],
+            alpha=style["alpha"],
+            zorder=style["zorder"],
+        )
+        has_plotted = True
+
+    limit_t = _stage6_adaptive_xlim(plotted_series, time_grid)
+
+    y_label = "Functionality" if weight_type == "Population" else "SVI-weighted recovery"
+    title_suffix = "population-weighted recovery" if weight_type == "Population" else "SVI-weighted recovery"
+    style_axis(
+        ax,
+        title=f"{scenario_name}: {title_suffix}",
+        xlabel="Time (hours)",
+        ylabel=y_label,
+        title_size=FS_LABEL,
+        title_weight="normal",
+    )
+    ax.set_xlim(0, limit_t)
+    ax.set_ylim(-0.02, 1.05)
+    ax.grid(True, linestyle="--", alpha=0.45)
+
+    if has_plotted:
+        legend = ax.legend(
+            loc="lower right",
+            frameon=False,
+            ncol=1,
+            handlelength=2.1,
+            labelspacing=0.35,
+            borderpad=0.2,
+        )
+        format_legend(legend)
+
+    weight_slug = (
+        str(weight_type)
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    save_plot(fig, stage_dir, f"vis_stage6_recovery_curve_{scenario_name}_{weight_slug}.png")
+
+
+def _stage6_plot_recovery_curves_from_csv(stage_dir: str) -> None:
+    """Driver: read the Stage 6 main curves CSV and regenerate the existing recovery plots."""
+    df_curves, time_grid, csv_path = _stage6_load_recovery_curves_csv(stage_dir, raw_baseline=False)
+    if df_curves is None or time_grid is None:
+        return
+
+    curves_by_weight = _stage6_reconstruct_curve_dicts(df_curves, time_grid, raw_baseline=False)
+    if not any(curves_by_weight.get(weight) for weight in curves_by_weight):
+        print(f"  [Stage 6] No recognized recovery curves found in: {csv_path}")
+        return
+
+    print(f"  [Stage 6] Plotting recovery curves from: {csv_path}")
+    for scenario in SCENARIOS:
+        pop_curves = curves_by_weight.get("Population", {}).get(scenario, {})
+        svi_curves = curves_by_weight.get("SVI_Weighted", {}).get(scenario, {})
+
+        if pop_curves:
+            _stage6_plot_single_scenario_recovery_curve(
+                scenario_name=scenario,
+                data_dict=pop_curves,
+                weight_type="Population",
+                stage_dir=stage_dir,
+                time_grid=time_grid,
+            )
+        if svi_curves:
+            _stage6_plot_single_scenario_recovery_curve(
+                scenario_name=scenario,
+                data_dict=svi_curves,
+                weight_type="SVI_Weighted",
+                stage_dir=stage_dir,
+                time_grid=time_grid,
+            )
+
+
 def vis_stage6(
     cfg=None, 
     stage_0_data=None, 
@@ -1800,27 +3077,30 @@ def vis_stage6(
     out_dirs=None
 ):
     """
-    Stage 6: Dumbbell & Diverging Gap Plots.
-    STRICT MODE: NO VARIABLE RENAMING.
-    FIXED LAYOUT: Handles text overlap, long labels, and zero-gap visualization.
+    Generate the Stage 6 equity-comparison figures and recovery-curve exports.
+
+    This stage visualizes population-weighted versus SVI-weighted recovery
+    outcomes using compact dumbbell, diverging-gap, and reconstructed recovery
+    curve panels. The implementation preserves the raw strategy naming logic of
+    the current workflow while applying fixed publication-oriented layout rules.
     """
     if out_dirs and "STAGE6_DIR" in out_dirs:
         stage_dir = out_dirs["STAGE6_DIR"]
     else:
         stage_dir = os.path.join(OUTPUT_ROOT, "Stage 6 Output")
     
-    if not ensure_dir(stage_dir): return
+    if not os.path.exists(stage_dir):
+        print(f"  [Warning] Directory not found: {stage_dir}")
+        return
 
     print("--- Visualizing Stage 6 (Strict Raw Names + Fixed Layout) ---")
+    apply_publication_style()
+
+    _stage6_plot_recovery_curves_from_csv(stage_dir)
     
     # 1. Load Data
-    target_file = os.path.join(stage_dir, "recovery_kpis_all_system.csv")
-    if not os.path.exists(target_file):
-        print(f"  [Skip] File not found: {target_file}")
-        return
-    try:
-        df = pd.read_csv(target_file)
-    except Exception:
+    df, target_file = _stage6_load_recovery_kpis_csv(stage_dir, raw_baseline=False)
+    if df is None or target_file is None:
         return
 
     # 2. Process Data (Pop vs SVI)
@@ -1828,15 +3108,19 @@ def vis_stage6(
     df = df[np.isfinite(df["T50"])]
     
     def _is_svi(r): 
+        """Identify whether a Stage 6 rule label belongs to the SVI-weighted track."""
         r_str = str(r).lower()
         return ("svipop" in r_str.lower()) or (r_str.endswith("_svi")) or ("_svi_" in r_str.lower())
 
     def _get_raw_base_name(r):
+        """Strip weighting and raw-baseline suffixes from a Stage 6 rule label."""
         r = str(r).strip()
+        base = r
         for suffix in ["_svipop", "_svi", "_pop"]:
             if r.lower().endswith(suffix):
-                return r[:len(r)-len(suffix)]
-        return r
+                base = r[:len(r)-len(suffix)]
+                break
+        return base.replace("_RawBaseline", "")
 
     df["Weighting"] = df["rule"].apply(lambda x: "SVI" if _is_svi(x) else "Pop")
     df["Strategy"] = df["rule"].apply(_get_raw_base_name)
@@ -1854,39 +3138,57 @@ def vis_stage6(
 
     wide["Gap"] = wide["SVI"] - wide["Pop"]
     wide = wide.sort_values(["scenario", "Strategy"], ascending=[True, False])
-    scenarios = wide["scenario"].unique()
     
-    # Global Style
-    try:
-        sns.set_style("whitegrid")
-    except:
-        plt.style.use("seaborn-whitegrid")
-    plt.rcParams['font.family'] = 'sans-serif'
+    def _display_strategy_label(name: str) -> str:
+        """Map raw Stage 6 strategy names to their equity-figure display labels."""
+        return stage6_equity_display_name(name)
 
+    main_text_scenarios = ["2pc50", "Northridge", "SanFernando"]
+    strategy_order = STAGE6_EQUITY_DISPLAY_ORDER.copy()
+
+    wide_main = wide[wide["scenario"].isin(main_text_scenarios)].copy()
+    wide_main["scenario"] = pd.Categorical(
+        wide_main["scenario"],
+        categories=main_text_scenarios,
+        ordered=True,
+    )
+    wide_main["Strategy_Display"] = wide_main["Strategy"].apply(_display_strategy_label)
+    extra_strategy_labels = [
+        lab for lab in wide_main["Strategy_Display"].dropna().unique().tolist()
+        if lab not in strategy_order
+    ]
+    wide_main["Strategy_Display"] = pd.Categorical(
+        wide_main["Strategy_Display"],
+        categories=strategy_order + extra_strategy_labels,
+        ordered=True,
+    )
+    wide_main = wide_main.sort_values(["scenario", "Strategy_Display"]).copy()
+    scenarios = [s for s in main_text_scenarios if s in wide_main["scenario"].astype(str).tolist()]
+    
     # ==========================================================================
     # FIG 1: Multi-Scenario Dumbbell Plot
     # ==========================================================================
     nrows = len(scenarios)
-    fig, axes = plt.subplots(nrows, 1, figsize=(11, max(6, 4.5 * nrows)))
+    fig_height_cm = max(COMPOSITE_FULL_DEFAULT["height_cm"], 4.6 * nrows + 1.8)
+    fig, axes = plt.subplots(
+        nrows,
+        1,
+        figsize=get_figsize("COMPOSITE_FULL_DEFAULT", height_cm=fig_height_cm),
+    )
     if nrows == 1:
         axes = [axes]
-
-    # --- Consistent typography across FIG 1 & FIG 2 ---
-    FS_SUPTITLE = 20
-    FS_SCEN_TITLE = 15
-    FS_AXIS_LABEL = 13
-    FS_TICK_X = 11
-    FS_TICK_Y = 10
-    FS_ANNO = 9
 
     c_pop = "#1f77b4"  # Blue
     c_svi = "#ff7f0e"  # Orange
     c_neu = "#444444"  # Dark Grey
+    dumbbell_marker_size = 58
+    identical_marker_size = 46
+    annotation_size = max(FS_ANNOTATION - 1.0, 5.8)
 
     eps_identical = 1e-6  # strict identical check (prevents false "identical" markers)
 
     for ax, scen in zip(axes, scenarios):
-        data = wide[wide["scenario"] == scen].copy()
+        data = wide_main[wide_main["scenario"].astype(str) == scen].copy()
         y_pos = np.arange(len(data))
 
         # --- Handle "not applicable" scenario: all Pop/SVI are zero (placeholder) ---
@@ -1897,19 +3199,17 @@ def vis_stage6(
         if all_zero:
             # Keep y-axis strategies, but do not plot meaningless zeros
             ax.set_yticks(y_pos)
-            ax.set_yticklabels(data["Strategy"], fontsize=FS_TICK_Y)
-            ax.set_title(f"Scenario: {scen}", fontweight="bold", pad=12, fontsize=FS_SCEN_TITLE)
+            ax.set_yticklabels(data["Strategy_Display"].astype(str), fontsize=FS_TICK)
             ax.grid(axis="x", linestyle="--", alpha=0.5)
 
             ax.set_xlim(0.0, 1.0)
-            ax.set_xlabel("Recovery Time T50 (hours)", fontsize=FS_AXIS_LABEL)
-            ax.tick_params(axis="x", labelsize=FS_TICK_X)
+            style_axis(ax, title=scen, xlabel="Recovery time T50 (hours)")
 
             ax.text(
                 0.5, 0.5, "T50 not applicable",
                 transform=ax.transAxes,
                 ha="center", va="center",
-                fontsize=FS_AXIS_LABEL,
+                fontsize=FS_LABEL,
                 color=c_neu,
                 fontweight="bold",
             )
@@ -1922,21 +3222,21 @@ def vis_stage6(
             xmax=data["SVI"],
             color="grey",
             alpha=0.4,
-            linewidth=2,
+            linewidth=1.1,
             zorder=1,
         )
 
         # Draw endpoints
         ax.scatter(
             data["Pop"], y_pos,
-            color=c_pop, s=130,
-            label="Pop Weighted", zorder=3,
+            color=c_pop, s=dumbbell_marker_size,
+            label="Population-weighted", zorder=3,
             edgecolors="white",
         )
         ax.scatter(
             data["SVI"], y_pos,
-            color=c_svi, s=130,
-            label="SVI Weighted", zorder=3,
+            color=c_svi, s=dumbbell_marker_size,
+            label="SVI-weighted", zorder=3,
             edgecolors="white",
         )
 
@@ -1947,7 +3247,7 @@ def vis_stage6(
                 pop_vals[overlap_mask],
                 y_pos[overlap_mask],
                 color=c_neu,
-                s=130,
+                s=identical_marker_size,
                 zorder=4,
                 edgecolors="white",
             )
@@ -1966,9 +3266,10 @@ def vis_stage6(
                     f"{p:.1f}",
                     va="center",
                     ha="left",
-                    fontsize=FS_ANNO,
-                    fontweight="bold",
+                    fontsize=annotation_size,
+                    fontweight="normal",
                     color=c_neu,
+                    alpha=0.85,
                 )
             else:
                 ha_p = "right" if p < s else "left"
@@ -1979,9 +3280,10 @@ def vis_stage6(
                     f"{p:.1f}",
                     va="center",
                     ha=ha_p,
-                    fontsize=FS_ANNO,
-                    fontweight="bold",
+                    fontsize=annotation_size,
+                    fontweight="normal",
                     color=c_pop,
+                    alpha=0.85,
                 )
 
                 ha_s = "left" if p < s else "right"
@@ -1992,19 +3294,18 @@ def vis_stage6(
                     f"{s:.1f}",
                     va="center",
                     ha=ha_s,
-                    fontsize=FS_ANNO,
-                    fontweight="bold",
+                    fontsize=annotation_size,
+                    fontweight="normal",
                     color=c_svi,
+                    alpha=0.85,
                 )
 
         ax.set_yticks(y_pos)
-        ax.set_yticklabels(data["Strategy"], fontsize=FS_TICK_Y)
-        ax.set_title(f"Scenario: {scen}", fontweight="bold", pad=12, fontsize=FS_SCEN_TITLE)
+        ax.set_yticklabels(data["Strategy_Display"].astype(str), fontsize=FS_TICK)
         ax.grid(axis="x", linestyle="--", alpha=0.5)
 
         # Per-subplot x label (requested)
-        ax.set_xlabel("Recovery Time T50 (hours)", fontsize=FS_AXIS_LABEL)
-        ax.tick_params(axis="x", labelsize=FS_TICK_X)
+        style_axis(ax, title=scen, xlabel="Recovery time T50 (hours)")
 
         all_vals = np.concatenate([data["Pop"].values, data["SVI"].values])
         if len(all_vals) > 0:
@@ -2012,36 +3313,143 @@ def vis_stage6(
             pad = (mx - mn) * 0.15 if mx > mn else 1.0
             ax.set_xlim(max(0.0, mn - pad), mx + pad)
 
-    fig.suptitle(
-        "Equity Gap Analysis: Population vs. SVI Weighted Recovery Time (T50)",
-        fontsize=FS_SUPTITLE,
-        fontweight="bold",
-        y=0.98,
-    )
-
     handles = [
-        mlines.Line2D([], [], color=c_pop, marker="o", linestyle="None", markersize=10, label="Pop Weighted (General)"),
-        mlines.Line2D([], [], color=c_svi, marker="o", linestyle="None", markersize=10, label="SVI Weighted (Vulnerable)"),
-        mlines.Line2D([], [], color=c_neu, marker="o", linestyle="None", markersize=10, label="Identical Time"),
+        mlines.Line2D([], [], color=c_pop, marker="o", linestyle="None", markersize=6, label="Population-weighted (General population)"),
+        mlines.Line2D([], [], color=c_svi, marker="o", linestyle="None", markersize=6, label="SVI-weighted (Vulnerable population)"),
+        mlines.Line2D([], [], color=c_neu, marker="o", linestyle="None", markersize=6, label="Identical recovery time"),
     ]
+    legend_labels = [handle.get_label() for handle in handles]
 
     plt.tight_layout()
-    plt.subplots_adjust(top=0.93, bottom=0.10, left=0.25, hspace=0.45)
+    plt.subplots_adjust(bottom=0.12, left=0.28, hspace=0.58)
 
     # Bring legend closer (was too far)
-    fig.legend(
+    legend = fig.legend(
         handles=handles,
+        labels=legend_labels,
         loc="lower center",
         bbox_to_anchor=(0.5, 0.02),
         ncol=3,
         frameon=False,
-        fontsize=12,
     )
+    format_legend(legend)
 
     save_plot(fig, stage_dir, "vis_stage6_Dumbbell_RawNames.png")
 
+    # ==========================================================================
+    # FIG 2: Multi-Scenario Diverging Gap Plot
+    # ==========================================================================
+    if scenarios:
+        nrows = len(scenarios)
+        fig_height_cm = max(COMPOSITE_FULL_DEFAULT["height_cm"], 4.8 * nrows + 2.1)
+        fig, axes = plt.subplots(
+            nrows,
+            1,
+            figsize=get_figsize("COMPOSITE_FULL_DEFAULT", height_cm=fig_height_cm),
+        )
+        if nrows == 1:
+            axes = [axes]
+
+        c_faster = "#2ca02c"
+        c_slower = "#d62728"
+        c_neutral = "#8c8c8c"
+        gap_neutral_threshold = 0.05
+        gap_annotation_size = max(FS_ANNOTATION - 1.2, 5.6)
+
+        max_abs_gap = float(np.nanmax(np.abs(wide_main["Gap"].values))) if not wide_main.empty else 0.0
+        x_limit = max(0.35, max_abs_gap * 1.18)
+        text_offset = max(0.03, x_limit * 0.025)
+
+        for ax, scen in zip(axes, scenarios):
+            data = wide_main[wide_main["scenario"].astype(str) == scen].copy()
+            y_pos = np.arange(len(data))
+            gaps = pd.to_numeric(data["Gap"], errors="coerce").fillna(0.0).values
+
+            bar_colors = []
+            for gap in gaps:
+                if gap < -gap_neutral_threshold:
+                    bar_colors.append(c_faster)
+                elif gap > gap_neutral_threshold:
+                    bar_colors.append(c_slower)
+                else:
+                    bar_colors.append(c_neutral)
+
+            ax.barh(
+                y_pos,
+                gaps,
+                color=bar_colors,
+                edgecolor="none",
+                height=0.60,
+                zorder=2,
+            )
+            ax.axvline(0.0, color="#4a4a4a", linewidth=0.9, zorder=1)
+
+            for idx, gap in enumerate(gaps):
+                if gap < -gap_neutral_threshold:
+                    text_color = c_faster
+                elif gap > gap_neutral_threshold:
+                    text_color = c_slower
+                else:
+                    text_color = c_neutral
+
+                if np.isclose(gap, 0.0, atol=gap_neutral_threshold):
+                    x_text = text_offset
+                    ha = "left"
+                else:
+                    x_text = gap + (text_offset if gap > 0 else -text_offset)
+                    ha = "left" if gap > 0 else "right"
+
+                ax.text(
+                    x_text,
+                    idx,
+                    f"{gap:+.1f}",
+                    va="center",
+                    ha=ha,
+                    fontsize=gap_annotation_size,
+                    color=text_color,
+                    alpha=0.9,
+                )
+
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(data["Strategy_Display"].astype(str), fontsize=FS_TICK)
+            style_axis(
+                ax,
+                title=scen,
+                xlabel="T50 gap (hours): SVI-weighted minus population-weighted",
+                title_weight="normal",
+            )
+            ax.set_xlim(-x_limit, x_limit)
+            ax.grid(axis="x", linestyle="--", alpha=0.45)
+
+        fig.suptitle(
+            "Equity gap in recovery time",
+            fontsize=FS_PANEL,
+            fontweight="normal",
+            y=0.995,
+        )
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.95, bottom=0.12, left=0.30, hspace=0.72)
+
+        legend_handles = [
+            mpatches.Patch(color=c_faster, label="SVI-weighted faster"),
+            mpatches.Patch(color=c_slower, label="SVI-weighted slower"),
+            mpatches.Patch(color=c_neutral, label="Near-equal recovery"),
+        ]
+        legend_labels = [handle.get_label() for handle in legend_handles]
+        legend = fig.legend(
+            handles=legend_handles,
+            labels=legend_labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.02),
+            ncol=3,
+            frameon=False,
+        )
+        format_legend(legend)
+
+        save_plot(fig, stage_dir, "vis_stage6_Diverging_RawNames.png")
+
     # ======================================================================
-    # EXTRA: Dual Topology Recovery (Stage 3 baseline + Stage 4 rules + Stage 5 GA)
+    # Dual Topology Recovery (Stage 3 baseline + Stage 4 rules + Stage 5 GA)
     # Output goes to Stage 6 Output folder.
     # ======================================================================
     import glob
@@ -2052,54 +3460,84 @@ def vis_stage6(
 
     # Same style map as Stage 4 (keep labels consistent with LEGEND_ORDER)
     style_map = {
-        "random": {
-            "color": "lightgray",
-            "ls": ":",
-            "lw": 2.5,
-            "label": "Baseline (Random)",
-        },
         "centrality-first": {
             "color": "#e41a1c",
-            "ls": "-",
-            "lw": 3.0,
-            "label": "Impact λ2-First (Grid Topology)",
+            "ls": "-.",
+            "lw": 1.0,
+            "label": "Impact λ2 (Grid Topology) First",
+            "alpha": 0.7,
+            "zorder": 5,
+        },
+        "betweenness-first": {
+            "color": "#ffd92f",
+            "ls": "-.",
+            "lw": 1.0,
+            "label": "Betweenness First (Bridges)",
+            "alpha": 0.7,
+            "zorder": 5,
         },
         "impact-first": {
             "color": "#ff7f00",
-            "ls": "-",
-            "lw": 3.0,
-            "label": "Impact-First (Population)",
-        },
-        "betweenness-first": {
-            "color": "#4daf4a",
-            "ls": "-",
-            "lw": 3.0,
-            "label": "Betweenness-First (Bridges)",
+            "ls": ":",
+            "lw": 1.05,
+            "label": "Impact (Population) First",
+            "alpha": 0.7,
+            "zorder": 4,
         },
         "degree-first": {
-            "color": "#984ea3",
-            "ls": "-",
-            "lw": 3.0,
-            "label": "Degree-First (Hubs)",
+            "color": "#4daf4a",
+            "ls": "--",
+            "lw": 1.0,
+            "label": "Degree First (Hubs)",
+            "alpha": 0.7,
+            "zorder": 6,
         },
         "closeness-first": {
             "color": "#377eb8",
-            "ls": "-",
-            "lw": 3.0,
+            "ls": "--",
+            "lw": 1.0,
             "label": "Closeness-First (Accessibility)",
+            "alpha": 0.7,
+            "zorder": 7,
         },
         "hospital-first": {
             "color": "#555555",
             "ls": "-",
-            "lw": 3.0,
+            "lw": 1.0,
             "label": "Hospital-First (Critical Nodes)",
+            "alpha": 0.6,
+            "zorder": 3,
+        },
+        "random": {
+            "color": "lightgray",
+            "ls": "-",
+            "lw": 0.95,
+            "label": "Random Baseline",
+            "alpha": 0.6,
+            "zorder": 1,
         },
     }
+
+    stage6_topology_baseline_label = "Theoretical Limit"
+    stage6_topology_baseline_style = _stage6_line_style("S3_Mean", role="topology")
+    style_map["centrality-first"]["label"] = "Impact lambda2 (Grid Topology) First"
+    style_map["betweenness-first"]["label"] = "Betweenness First (Bridges)"
+    style_map["impact-first"]["label"] = "Impact (Population) First"
+    style_map["degree-first"]["label"] = "Degree First (Hubs)"
+    style_map["closeness-first"]["label"] = "Closeness First (Accessibility)"
+    style_map["hospital-first"]["label"] = "Hospital First (Critical Nodes)"
+    style_map["random"]["label"] = "Random Baseline"
+    for _stage6_rule in ["centrality-first", "betweenness-first", "impact-first", "degree-first", "closeness-first", "hospital-first", "random"]:
+        style_map[_stage6_rule].update(_stage6_line_style(_stage6_rule, role="topology"))
 
     for scen in SCENARIOS:
         print(f"\n[Stage 6] Processing Dual Topology: {scen}...")
 
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        fig, axes = plt.subplots(
+            1,
+            2,
+            figsize=get_figsize("COMPOSITE_FULL_DENSE", height_cm=10.2),
+        )
         has_any = False
         x_candidates = []
         ga_labels = []
@@ -2116,12 +3554,12 @@ def vis_stage6(
                     axes[0].plot(
                         df_s3["t"],
                         lcc_series,
-                        color="black",
-                        ls="--",
-                        lw=2,
-                        label="Theoretical Limit (Unconstrained)",
-                        alpha=0.6,
-                        zorder=0,
+                        color=stage6_topology_baseline_style["color"],
+                        ls=stage6_topology_baseline_style["ls"],
+                        lw=stage6_topology_baseline_style["lw"],
+                        label=stage6_topology_baseline_label,
+                        alpha=stage6_topology_baseline_style["alpha"],
+                        zorder=stage6_topology_baseline_style["zorder"],
                     )
                     has_any = True
 
@@ -2133,12 +3571,12 @@ def vis_stage6(
                     axes[1].plot(
                         df_s3["t"],
                         df_s3["avg_degree"],
-                        color="black",
-                        ls="--",
-                        lw=2,
-                        label="Theoretical Limit (Unconstrained)",
-                        alpha=0.6,
-                        zorder=0,
+                        color=stage6_topology_baseline_style["color"],
+                        ls=stage6_topology_baseline_style["ls"],
+                        lw=stage6_topology_baseline_style["lw"],
+                        label=stage6_topology_baseline_label,
+                        alpha=stage6_topology_baseline_style["alpha"],
+                        zorder=stage6_topology_baseline_style["zorder"],
                     )
                     has_any = True
             except Exception:
@@ -2168,7 +3606,8 @@ def vis_stage6(
                     ls=st["ls"],
                     lw=st["lw"],
                     label=st["label"],
-                    alpha=0.9,
+                    alpha=st["alpha"],
+                    zorder=st["zorder"],
                 )
                 has_any = True
 
@@ -2185,7 +3624,8 @@ def vis_stage6(
                     ls=st["ls"],
                     lw=st["lw"],
                     label=st["label"],
-                    alpha=0.9,
+                    alpha=st["alpha"],
+                    zorder=st["zorder"],
                 )
                 has_any = True
 
@@ -2200,15 +3640,31 @@ def vis_stage6(
                 continue
 
             policy_name = os.path.basename(fp).replace(f"ga_graphrobustness_{scen}_", "").replace(".csv", "")
-            ga_label = f"GA ({policy_name})"
+            policy_display_name = "HospitalFirst" if policy_name == "HospFirst" else policy_name
+            ga_label = f"GA ({policy_display_name})"
             ga_labels.append(ga_label)
+            ga_style_key = {
+                "Balanced": "GA_Balanced",
+                "HospFirst": "GA_HospFirst",
+                "Efficiency": "GA_Efficiency",
+            }.get(policy_name)
+            ga_style = _stage6_line_style(ga_style_key, role="topology") if ga_style_key else {
+                "color": "#6a6a6a",
+                "ls": "-",
+                "lw": 1.0,
+                "alpha": 0.85,
+                "zorder": 9,
+            }
 
             if "lcc_fraction" in df_ga.columns:
                 axes[0].plot(
                     df_ga["t"],
                     df_ga["lcc_fraction"],
-                    lw=3.0,
-                    alpha=0.9,
+                    color=ga_style["color"],
+                    ls=ga_style["ls"],
+                    lw=ga_style["lw"],
+                    alpha=ga_style["alpha"],
+                    zorder=ga_style["zorder"],
                     label=ga_label,
                 )
                 has_any = True
@@ -2221,8 +3677,11 @@ def vis_stage6(
                 axes[1].plot(
                     df_ga["t"],
                     df_ga["avg_degree"],
-                    lw=3.0,
-                    alpha=0.9,
+                    color=ga_style["color"],
+                    ls=ga_style["ls"],
+                    lw=ga_style["lw"],
+                    alpha=ga_style["alpha"],
+                    zorder=ga_style["zorder"],
                     label=ga_label,
                 )
                 has_any = True
@@ -2241,17 +3700,23 @@ def vis_stage6(
         limit_t = limit_t * 1.2
 
         # Subplot 1 settings
-        axes[0].set_title(f"Connectivity Recovery (LCC) for {scen}", fontweight="bold", fontsize=18, pad=8)
-        axes[0].set_xlabel("Time (Hours)", fontsize=16)
-        axes[0].set_ylabel("Giant Component Fraction", fontsize=16)
+        style_axis(
+            axes[0],
+            title=f"{scen}: connectivity",
+            xlabel="Time (hours)",
+            ylabel="Giant component fraction",
+        )
         axes[0].set_xlim(0, limit_t)
         axes[0].set_ylim(-0.02, 1.05)
         axes[0].grid(True, linestyle="--", alpha=0.5)
 
         # Subplot 2 settings
-        axes[1].set_title(f"Network Density Recovery (Avg Degree) for {scen}", fontweight="bold", fontsize=18, pad=8)
-        axes[1].set_xlabel("Time (Hours)", fontsize=16)
-        axes[1].set_ylabel("Average Degree (k)", fontsize=16)
+        style_axis(
+            axes[1],
+            title=f"{scen}: average degree",
+            xlabel="Time (hours)",
+            ylabel="Average degree (k)",
+        )
         axes[1].set_xlim(0, limit_t)
         axes[1].grid(True, linestyle="--", alpha=0.5)
 
@@ -2260,8 +3725,10 @@ def vis_stage6(
         h2, l2 = axes[1].get_legend_handles_labels()
         all_dict = dict(zip(l1 + l2, h1 + h2))
 
-        # Extend legend order to include GA labels (otherwise they get filtered out)
-        legend_order = list(LEGEND_ORDER) + [x for x in ga_labels if x not in LEGEND_ORDER]
+        # Use the Stage 6 topology legend order, then append any unexpected labels.
+        legend_order = list(STAGE6_TOPOLOGY_LEGEND_ORDER) + [
+            x for x in ga_labels if x not in STAGE6_TOPOLOGY_LEGEND_ORDER
+        ]
 
         h, l = [], []
         for name in legend_order:
@@ -2273,24 +3740,23 @@ def vis_stage6(
             h = list(all_dict.values())
             l = list(all_dict.keys())
 
-        fig.set_size_inches(16, 9)
         plt.tight_layout()
-        plt.subplots_adjust(bottom=0.25)
+        plt.subplots_adjust(bottom=0.33, wspace=0.24)
 
         if h:
-            fig.legend(
+            legend = fig.legend(
                 h, l,
                 loc="lower center",
-                bbox_to_anchor=(0.5, 0.05),
+                bbox_to_anchor=(0.5, 0.07),
                 ncol=4,
-                fontsize=15,
-                frameon=True,
-                edgecolor="#cccccc",
+                frameon=False,
+                columnspacing=1.0,
+                handlelength=2.0,
             )
+            format_legend(legend)
 
         out_path = os.path.join(stage_dir, f"vis_stage6_topology_dual_{scen}.png")
-        fig.savefig(out_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
+        save_figure(fig, out_path)
         print(f"  -> Saved Stage 6 Dual Topology Plot: {out_path}")
 
 # ==============================================================================
@@ -2304,11 +3770,17 @@ def vis_stage7_cluster_top10_impact_degree_km(
     impact_mode: str = "lambda2",  # "lambda2" or "pop"
 ) -> None:
     """
-    Stage 7: Visualize cluster map with top-N impact degree substations.
+    Plot one Stage 7 cluster footprint together with top-ranked substations.
+
+    The panel overlays the selected tract cluster, the city boundary, all
+    substations, and the top-ranked impact and degree substations in a local
+    kilometer-based frame to support cluster-level interpretation.
     """
     stage7_dir = os.path.join(OUTPUT_ROOT, "Stage 7 Output")
-    if not ensure_dir(stage7_dir):
+    if not os.path.exists(stage7_dir):
+        print(f"  [Warning] Directory not found: {stage7_dir}")
         return
+    apply_publication_style()
     if gdf is None or gdf.empty:
         print("  [Stage 7] gdf is None/empty, skip cluster+top10 map.")
         return
@@ -2322,16 +3794,10 @@ def vis_stage7_cluster_top10_impact_degree_km(
     if df_clu.empty or ("tract_id" not in df_clu.columns) or ("cluster" not in df_clu.columns):
         print("  [Stage 7] clusters CSV missing tract_id/cluster, skip cluster+top10 map.")
         return
-
-    def _norm_tract_id(s: pd.Series) -> pd.Series:
-        return (
-            s.astype(str)
-             .str.extract(r"(\d+)")[0]
-             .str.zfill(11)
-        )
+    hotspot_ids = _stage7_hotspot_ids(stage7_dir, df_clu)
 
     df_clu = df_clu[["tract_id", "cluster"]].copy()
-    df_clu["tract_id"] = _norm_tract_id(df_clu["tract_id"])
+    df_clu["tract_id"] = _canonical_tract_fips11(df_clu["tract_id"])
     df_clu["cluster"] = df_clu["cluster"].astype(str)
     clu_key = str(cluster_id)
 
@@ -2339,7 +3805,7 @@ def vis_stage7_cluster_top10_impact_degree_km(
     if "tract_id" not in g_all.columns:
         print("  [Stage 7] gdf missing tract_id, skip cluster+top10 map.")
         return
-    g_all["tract_id"] = _norm_tract_id(g_all["tract_id"])
+    g_all["tract_id"] = _canonical_tract_fips11(g_all["tract_id"])
 
     try:
         g_all = g_all.to_crs(epsg=3310)
@@ -2380,6 +3846,7 @@ def vis_stage7_cluster_top10_impact_degree_km(
     from shapely.affinity import translate, scale
 
     def _km_shift(geom):
+        """Recenter projected geometries and express coordinates in kilometers."""
         if geom is None or geom.is_empty:
             return geom
         g0 = translate(geom, xoff=-center_x, yoff=-center_y)
@@ -2396,6 +3863,7 @@ def vis_stage7_cluster_top10_impact_degree_km(
     merged_km = merged_km.set_crs(None, allow_override=True)
 
     cluster_polys = merged_km.loc[merged_km["cluster"] == clu_key].copy()
+    hotspot_polys = merged_km.loc[merged_km["tract_id"].isin(hotspot_ids)].copy()
 
     # --- City boundary in km coords ---
     city_km = None
@@ -2452,6 +3920,7 @@ def vis_stage7_cluster_top10_impact_degree_km(
     top_degree_km = None
 
     def _pick_col(frame: pd.DataFrame, prefer_list, contains_list):
+        """Select the first matching column from preferred names or token hints."""
         for p in prefer_list:
             if p in frame.columns:
                 return p
@@ -2461,9 +3930,6 @@ def vis_stage7_cluster_top10_impact_degree_km(
                 if kw in cl:
                     return c
         return None
-
-    def _clean_id_series(s: pd.Series) -> pd.Series:
-        return s.astype(str).str.strip().str.replace(".0", "", regex=False)
 
     if os.path.exists(cent_file):
         df_cent = pd.read_csv(cent_file)
@@ -2478,8 +3944,8 @@ def vis_stage7_cluster_top10_impact_degree_km(
             if impact_col is None:
                 impact_col = _pick_col(df_cent, ["impact", "Impact"], ["impact"])
 
-            devices["join_key"] = _clean_id_series(devices[dev_id_col])
-            df_cent["join_key"] = _clean_id_series(df_cent[id_col])
+            devices["join_key"] = _canonical_substation_key(devices[dev_id_col])
+            df_cent["join_key"] = _canonical_substation_key(df_cent[id_col])
 
             if impact_col is not None:
                 top_imp = df_cent.nlargest(int(top_n), impact_col).merge(devices, on="join_key", how="left")
@@ -2524,7 +3990,7 @@ def vis_stage7_cluster_top10_impact_degree_km(
         print(f"  [Stage 7] Centrality file not found: {cent_file}")
 
     # --- Plot (zoomed) ---
-    fig, ax = plt.subplots(figsize=(7.5, 7.5))
+    fig, ax = plt.subplots(figsize=get_figsize("PANEL_FULLROW", width_cm=13.2, height_cm=9.6))
 
     g_all_km.boundary.plot(ax=ax, color="#d0d0d0", linewidth=0.5, zorder=0)
 
@@ -2536,27 +4002,48 @@ def vis_stage7_cluster_top10_impact_degree_km(
 
     all_subs_km.plot(
         ax=ax, marker="x", color="#6e6e6e",
-        markersize=26, linewidth=1.1, alpha=0.75,
-        label="All substations", zorder=3,
+        markersize=11, linewidth=0.7, alpha=0.58,
+        label="Substations", zorder=3,
     )
 
+    impact_label = "population" if impact_mode.lower() == "pop" else "λ2"
     if top_impact_km is not None and not top_impact_km.empty:
         top_impact_km.plot(
             ax=ax, marker="o", color="#1f77b4",
-            markersize=85, linewidth=0.0,
-            label=f"Top {int(top_n)} by impact ({impact_mode})", zorder=4,
+            markersize=22, linewidth=0.0, alpha=0.9,
+            label=f"Top {int(top_n)} impact ({impact_label})", zorder=4,
         )
 
     if top_degree_km is not None and not top_degree_km.empty:
         top_degree_km.plot(
             ax=ax, marker="^", color="#2ca02c",
-            markersize=95, linewidth=0.0,
-            label=f"Top {int(top_n)} by degree", zorder=5,
+            markersize=26, linewidth=0.0, alpha=0.88,
+            label=f"Top {int(top_n)} degree", zorder=5,
         )
 
-    ax.set_title(f"Cluster {clu_key} Tracts (Shaded) with Top-{int(top_n)} Substations", fontsize=14, pad=10)
-    ax.set_xlabel("East–West distance from LA center (km)", fontsize=12)
-    ax.set_ylabel("North–South distance from LA center (km)", fontsize=12)
+    if not hotspot_polys.empty:
+        hotspot_polys.boundary.plot(
+            ax=ax,
+            color=STAGE7_HOTSPOT_COLOR,
+            linewidth=1.35,
+            alpha=0.96,
+            zorder=6,
+        )
+
+    style_axis(
+        ax,
+        title=f"Cluster {clu_key}",
+        xlabel="East-west distance (km)",
+        ylabel="North-south distance (km)",
+        title_pad=2.0,
+        title_size=FS_TITLE,
+        title_weight="normal",
+    )
+    ax.xaxis.label.set_fontsize(FS_LABEL)
+    ax.yaxis.label.set_fontsize(FS_LABEL)
+    ax.xaxis.labelpad = 2
+    ax.yaxis.labelpad = 5
+    ax.tick_params(axis="both", labelsize=FS_TICK)
     ax.set_aspect("equal", "box")
 
     # Zoom to LA City bounds (fallback: tracts bounds)
@@ -2565,33 +4052,365 @@ def vis_stage7_cluster_top10_impact_degree_km(
     else:
         minx, miny, maxx, maxy = g_all_km.total_bounds
 
-    pad_x = (maxx - minx) * 0.06
-    pad_y = (maxy - miny) * 0.06
+    pad_x = (maxx - minx) * 0.03
+    pad_y = (maxy - miny) * 0.03
     ax.set_xlim(minx - pad_x, maxx + pad_x)
     ax.set_ylim(miny - pad_y, maxy + pad_y)
-    ax.tick_params(axis='both', which='major', labelsize=12)
-    # Legend fix (smaller + inside + no overflow)
-    ax.legend(
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.12),
-        fontsize=11,
-        frameon=True,
-        framealpha=0.92,
-        borderpad=0.6,
-        labelspacing=0.4,
-        handletextpad=0.6,
-        handlelength=1.6,
-        markerscale=0.9,
-    )
 
-    fig.tight_layout()
+    handles, labels = ax.get_legend_handles_labels()
+    if not hotspot_polys.empty:
+        handles.append(
+            mlines.Line2D(
+                [],
+                [],
+                color=STAGE7_HOTSPOT_COLOR,
+                linewidth=1.35,
+                label="Recovery-vulnerability hotspots (Top 10)",
+            )
+        )
+        labels.append("Recovery-vulnerability hotspots (Top 10)")
+
+    legend = ax.legend(
+        handles=handles,
+        labels=labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.205),
+        frameon=False,
+        ncol=2,
+        borderpad=0.08,
+        labelspacing=0.32,
+        columnspacing=1.0,
+        handletextpad=0.3,
+        handlelength=1.15,
+        markerscale=0.62,
+        borderaxespad=0.0,
+    )
+    format_legend(legend)
+    for text in legend.get_texts():
+        text.set_fontsize(FS_LEGEND)
+
+    fig.subplots_adjust(left=0.11, right=0.985, top=0.92, bottom=0.36)
     save_plot(fig, stage7_dir, f"vis_stage7_cluster{clu_key}_top{int(top_n)}_impact_{impact_mode}_degree_km.png")
 
 def vis_stage7(gdf):
+    """Generate Stage 7 PCA diagnostics, cluster maps, and tract-typology profiles."""
     stage_dir = os.path.join(OUTPUT_ROOT, "Stage 7 Output")
-    if not ensure_dir(stage_dir):
+    if not os.path.exists(stage_dir):
+        print(f"  [Warning] Directory not found: {stage_dir}")
         return
     print("--- Visualizing Stage 7 ---")
+    apply_publication_style()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _add_inline_cluster_legend(ax, clusters_sorted, cluster_color_map, bbox_to_anchor):
+        """Render a one-line legend like 'Cluster  0  1  2 ...' below the axes."""
+        legend_handles = [
+            mpatches.Patch(facecolor="none", edgecolor="none", label="Cluster")
+        ]
+        legend_handles.extend(
+            [
+                mlines.Line2D(
+                    [],
+                    [],
+                    linestyle="None",
+                    marker="o",
+                    markersize=5.0,
+                    markerfacecolor=cluster_color_map[clu],
+                    markeredgecolor=cluster_color_map[clu],
+                    alpha=0.75,
+                    label=str(clu),
+                )
+                for clu in clusters_sorted
+            ]
+        )
+        legend_labels = [handle.get_label() for handle in legend_handles]
+        legend = ax.legend(
+            handles=legend_handles,
+            labels=legend_labels,
+            loc="upper center",
+            bbox_to_anchor=bbox_to_anchor,
+            ncol=len(legend_handles),
+            frameon=False,
+            handlelength=0.9,
+            handletextpad=0.35,
+            columnspacing=0.8,
+            borderaxespad=0.0,
+        )
+        format_legend(legend)
+        return legend
+
+    def _find_column_alias(frame: pd.DataFrame, aliases: list[str], contains_tokens=None):
+        """Resolve a column by exact normalized aliases or token containment."""
+        normalized = {
+            re.sub(r"[^a-z0-9]+", "", str(col).lower()): col
+            for col in frame.columns
+        }
+        for alias in aliases:
+            key = re.sub(r"[^a-z0-9]+", "", str(alias).lower())
+            if key in normalized:
+                return normalized[key]
+        if contains_tokens:
+            for col in frame.columns:
+                key = re.sub(r"[^a-z0-9]+", "", str(col).lower())
+                if all(tok in key for tok in contains_tokens):
+                    return col
+        return None
+
+    def _plot_stage7_scree(df_pc_stats: pd.DataFrame | None) -> None:
+        """Draw the Stage 7 scree plot from the exported PCA statistics table."""
+        if df_pc_stats is None or df_pc_stats.empty:
+            print("  [Warning] Stage 7 scree plot skipped: pca_stats_with_eigenvalues.csv is missing or empty.")
+            return
+
+        pc_col = _find_column_alias(
+            df_pc_stats,
+            aliases=["PC", "PrincipalComponent", "Principal Component", "Component"],
+            contains_tokens=["pc"],
+        )
+        eigen_col = _find_column_alias(
+            df_pc_stats,
+            aliases=["Eigenvalue", "Eigen Value", "eigen_value"],
+            contains_tokens=["eigen", "value"],
+        )
+
+        if pc_col is None or eigen_col is None:
+            print(
+                "  [Warning] Stage 7 scree plot skipped: required principal-component or eigenvalue column not found "
+                "in pca_stats_with_eigenvalues.csv."
+            )
+            return
+
+        df_scree = df_pc_stats[[pc_col, eigen_col]].copy()
+        df_scree[eigen_col] = pd.to_numeric(df_scree[eigen_col], errors="coerce")
+        df_scree = df_scree[np.isfinite(df_scree[eigen_col])].copy()
+        if df_scree.empty:
+            print("  [Warning] Stage 7 scree plot skipped: no valid eigenvalue rows found.")
+            return
+
+        def _pc_index(val):
+            """Extract a sortable principal-component index from a label or value."""
+            if pd.isna(val):
+                return np.nan
+            s = str(val).strip()
+            match = re.search(r"(\d+)", s)
+            if match:
+                return float(match.group(1))
+            try:
+                return float(s)
+            except Exception:
+                return np.nan
+
+        df_scree["_pc_idx"] = df_scree[pc_col].apply(_pc_index)
+        if df_scree["_pc_idx"].notna().any():
+            df_scree = df_scree[df_scree["_pc_idx"].notna()].copy()
+            df_scree = df_scree.sort_values("_pc_idx")
+        else:
+            df_scree["_pc_idx"] = np.arange(1, len(df_scree) + 1, dtype=float)
+
+        if df_scree.empty:
+            print("  [Warning] Stage 7 scree plot skipped: principal-component indices could not be resolved.")
+            return
+
+        fig, ax = plt.subplots(figsize=get_figsize("PANEL_HALF"))
+        ax.plot(
+            df_scree["_pc_idx"],
+            df_scree[eigen_col],
+            color="#2f5d7e",
+            marker="o",
+            markersize=4.2,
+            linewidth=1.2,
+            label="Eigenvalue",
+        )
+        ax.axhline(
+            1.0,
+            color="#6f6f6f",
+            linestyle="--",
+            linewidth=1.0,
+            label="Kaiser criterion (eigenvalue = 1)",
+        )
+
+        style_axis(
+            ax,
+            title="PCA scree plot",
+            xlabel="Principal component",
+            ylabel="Eigenvalue",
+            title_size=FS_LABEL,
+            title_weight="normal",
+        )
+        ax.set_xticks(df_scree["_pc_idx"].tolist())
+        ax.grid(axis="y", linestyle="--", alpha=0.45)
+
+        legend = ax.legend(
+            loc="upper right",
+            frameon=False,
+            handlelength=1.8,
+            borderpad=0.2,
+            labelspacing=0.35,
+        )
+        format_legend(legend)
+        save_plot(fig, stage_dir, "vis_stage7_pca_scree_plot.png")
+
+    def _compute_stage7_elbow_k(Ks: list[int], iners: list[float]):
+        """Compute elbow k using the endpoint-distance heuristic from the analysis workflow."""
+        if len(Ks) < 2 or len(iners) < 2:
+            return None
+
+        p1, p2 = np.array([Ks[0], iners[0]]), np.array([Ks[-1], iners[-1]])
+        denom = np.linalg.norm(p2 - p1)
+        if denom <= 0:
+            return int(Ks[0])
+
+        is_consecutive = Ks == list(range(Ks[0], Ks[0] + len(Ks)))
+        if is_consecutive:
+            dists = [
+                np.abs(np.cross(p2 - p1, p1 - np.array([k, iners[k - Ks[0]]]))) / denom
+                for k in Ks
+            ]
+            return int(np.argmax(dists) + Ks[0])
+
+        # Fallback for irregular k grids; equivalent point-to-line distance logic.
+        dists = [
+            np.abs(np.cross(p2 - p1, p1 - np.array([k, inertia]))) / denom
+            for k, inertia in zip(Ks, iners)
+        ]
+        return int(Ks[int(np.argmax(dists))])
+
+    def _plot_stage7_elbow(df_kdiag: pd.DataFrame | None, source_name: str) -> None:
+        """Draw the Stage 7 elbow curve and annotate the inferred elbow solution."""
+        if df_kdiag is None or df_kdiag.empty:
+            print(f"  [Warning] Stage 7 elbow plot skipped: {source_name} is missing or empty.")
+            return
+
+        k_col = _find_column_alias(
+            df_kdiag,
+            aliases=["k", "K", "n_clusters", "NumberOfClusters"],
+            contains_tokens=["k"],
+        )
+        inertia_col = _find_column_alias(
+            df_kdiag,
+            aliases=["inertia", "Inertia", "within_cluster_sse"],
+            contains_tokens=["inertia"],
+        )
+        silhouette_col = _find_column_alias(
+            df_kdiag,
+            aliases=["silhouette", "Silhouette", "silhouette_score"],
+            contains_tokens=["silhouette"],
+        )
+
+        if k_col is None or inertia_col is None:
+            print(
+                f"  [Warning] Stage 7 elbow plot skipped: required k or inertia column not found in {source_name}."
+            )
+            return
+
+        df_elbow = df_kdiag[[k_col, inertia_col]].copy()
+        if silhouette_col is not None:
+            df_elbow["_silhouette"] = pd.to_numeric(df_kdiag[silhouette_col], errors="coerce")
+
+        df_elbow[k_col] = pd.to_numeric(df_elbow[k_col], errors="coerce")
+        df_elbow[inertia_col] = pd.to_numeric(df_elbow[inertia_col], errors="coerce")
+        df_elbow = df_elbow[np.isfinite(df_elbow[k_col]) & np.isfinite(df_elbow[inertia_col])].copy()
+        if df_elbow.empty:
+            print(f"  [Warning] Stage 7 elbow plot skipped: no valid k/inertia rows found in {source_name}.")
+            return
+
+        df_elbow = df_elbow.sort_values(k_col)
+        Ks = df_elbow[k_col].astype(int).tolist()
+        iners = df_elbow[inertia_col].astype(float).tolist()
+        elbow_k = _compute_stage7_elbow_k(Ks, iners)
+        if elbow_k is None:
+            print(f"  [Warning] Stage 7 elbow plot skipped: elbow_k could not be computed from {source_name}.")
+            return
+
+        fig, ax = plt.subplots(figsize=get_figsize("PANEL_HALF"))
+        ax.plot(
+            Ks,
+            iners,
+            color="#2f5d7e",
+            marker="o",
+            markersize=4.2,
+            linewidth=1.2,
+            label="Inertia",
+        )
+
+        if elbow_k in Ks:
+            elbow_idx = Ks.index(elbow_k)
+            ax.scatter(
+                [Ks[elbow_idx]],
+                [iners[elbow_idx]],
+                color="#b22222",
+                s=34,
+                zorder=5,
+                label=f"Elbow (k = {elbow_k})",
+            )
+
+        style_axis(
+            ax,
+            title="K-means elbow plot (standardized features)",
+            xlabel="Number of clusters (k)",
+            ylabel="Inertia",
+            title_size=FS_LABEL,
+            title_weight="normal",
+        )
+        ax.set_xticks(Ks)
+        ax.grid(axis="y", linestyle="--", alpha=0.45)
+
+        legend = ax.legend(
+            loc="upper right",
+            frameon=False,
+            handlelength=1.8,
+            borderpad=0.2,
+            labelspacing=0.35,
+        )
+        format_legend(legend)
+        save_plot(fig, stage_dir, "vis_stage7_elbow_curve_analysis.png")
+
+    def _to_numeric_inplace(frame: pd.DataFrame, cols: list[str]) -> None:
+        """Convert selected columns to numeric safely."""
+        for c in cols:
+            if c in frame.columns:
+                frame[c] = pd.to_numeric(frame[c], errors="coerce")
+
+    pc_stats_lookup = {}
+    pc_stats_path = os.path.join(stage_dir, "pca_stats_with_eigenvalues.csv")
+    df_pc_stats = None
+    if os.path.exists(pc_stats_path):
+        try:
+            df_pc_stats = pd.read_csv(pc_stats_path)
+            _plot_stage7_scree(df_pc_stats)
+            if {"PC", "Explained_Variance_Ratio"}.issubset(df_pc_stats.columns):
+                pc_stats_lookup = {
+                    str(pc): float(ratio)
+                    for pc, ratio in zip(
+                        df_pc_stats["PC"],
+                        df_pc_stats["Explained_Variance_Ratio"],
+                    )
+                    if pd.notna(pc) and pd.notna(ratio)
+                }
+        except Exception as e:
+            print(f"  [Warning] Stage 7 scree plot skipped: failed to read pca_stats_with_eigenvalues.csv ({e}).")
+            df_pc_stats = None
+    else:
+        print("  [Info] Stage 7 pca_stats_with_eigenvalues.csv not found (skip scree plot).")
+
+    kdiag_candidates = [
+        "kmeans-k-diagnostics.csv",
+        "kmeans_k_diagnostics.csv",
+    ]
+    kdiag_path = next(
+        (os.path.join(stage_dir, name) for name in kdiag_candidates if os.path.exists(os.path.join(stage_dir, name))),
+        None,
+    )
+    if kdiag_path is not None:
+        try:
+            df_kdiag = pd.read_csv(kdiag_path)
+            _plot_stage7_elbow(df_kdiag, os.path.basename(kdiag_path))
+        except Exception as e:
+            print(f"  [Warning] Stage 7 elbow plot skipped: failed to read {os.path.basename(kdiag_path)} ({e}).")
+    else:
+        print("  [Info] Stage 7 kmeans diagnostics CSV not found (skip elbow plot).")
 
     csv_path = os.path.join(stage_dir, "clusters_labels_final.csv")
     if not os.path.exists(csv_path):
@@ -2603,27 +4422,9 @@ def vis_stage7(gdf):
         print("  [Skip] Stage 7 CSV is empty.")
         return
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    def _norm_tract_id(s: pd.Series) -> pd.Series:
-        """Extract digits and zfill to 11 (FIPS)."""
-        out = (
-            s.astype(str)
-             .str.extract(r"(\d+)")[0]
-             .str.zfill(11)
-        )
-        return out
-
-    def _to_numeric_inplace(frame: pd.DataFrame, cols: list[str]) -> None:
-        """Convert selected columns to numeric safely."""
-        for c in cols:
-            if c in frame.columns:
-                frame[c] = pd.to_numeric(frame[c], errors="coerce")
-
     # Normalize tract_id in df
     if "tract_id" in df.columns:
-        df["tract_id"] = _norm_tract_id(df["tract_id"])
+        df["tract_id"] = _canonical_tract_fips11(df["tract_id"])
     else:
         print("  [Skip] 'tract_id' missing in Stage 7 CSV.")
         return
@@ -2632,27 +4433,32 @@ def vis_stage7(gdf):
     if "cluster" not in df.columns:
         print("  [Skip] 'cluster' missing in Stage 7 CSV.")
         return
+    hotspot_ids = _stage7_hotspot_ids(stage_dir, df)
+
+    def _pc_axis_label(pc_name: str) -> str:
+        """Append explained-variance share to a principal-component axis label."""
+        ratio = pc_stats_lookup.get(pc_name)
+        if ratio is None:
+            return pc_name
+        return f"{pc_name} ({100.0 * ratio:.1f}%)"
 
     # ------------------------------------------------------------------
     # 0) PCA feature loadings heatmap (PC weights)
     # ------------------------------------------------------------------
     load_path = os.path.join(stage_dir, "pca_loadings.csv")
-    cluster_res_path = os.path.join(stage_dir, "clusters_labels_final.csv")
 
     if os.path.exists(load_path):
         df_load = pd.read_csv(load_path, index_col=0)
-        
-        if os.path.exists(cluster_res_path):
-            try:
-                df_c = pd.read_csv(cluster_res_path)
-                if "cluster" in df_c.columns:
-                    best_k = df_c["cluster"].nunique()
-                    limit_k = min(best_k, df_load.shape[1])
-                    
-                    print(f"  [Info] Limiting Heatmap to top {limit_k} PCs (Best-k clusters).")
-                    df_load = df_load.iloc[:, :limit_k]
-            except Exception as e:
-                print(f"  [Warning] Could not determine best_k from file: {e}")
+
+        # Detect PCA columns like PC1, PC2, ..., PCk
+        pc_cols = [c for c in df_load.columns if re.match(r"^PC\d+$", str(c).strip())]
+        pc_cols = sorted(pc_cols, key=lambda x: int(re.findall(r"\d+", x)[0]))
+
+        if pc_cols:
+            df_load = df_load.loc[:, pc_cols]
+            print(f"  [Info] PCA loadings: detected {len(pc_cols)} PCs ({pc_cols[0]}–{pc_cols[-1]}).")
+        else:
+            print(f"  [Info] PCA loadings: no PC* columns found; using all {df_load.shape[1]} columns.")
 
         if not df_load.empty:
             df_load = df_load.copy()
@@ -2662,9 +4468,10 @@ def vis_stage7(gdf):
             max_abs = max(max_abs, 1e-6)
 
             fig, ax = plt.subplots(
-                figsize=(
-                    max(6.0, 1.0 * df_load.shape[1] + 4.0), 
-                    max(6.0, 0.35 * df_load.shape[0] + 2.0),
+                figsize=get_figsize(
+                    "PANEL_ASYM_LEFT",
+                    width_cm=max(PANEL_ASYM_LEFT["width_cm"], 1.25 * df_load.shape[1] + 7.0),
+                    height_cm=max(PANEL_ASYM_LEFT["height_cm"], 0.9 * df_load.shape[0] + 4.0),
                 )
             )
 
@@ -2681,22 +4488,32 @@ def vis_stage7(gdf):
                 cbar_kws={"label": "PCA loading (feature weight)"},
                 ax=ax,
             )
+            mesh = ax.collections[0]
+            style_colorbar_with_endpoints(
+                mesh.colorbar,
+                float(mesh.norm.vmin),
+                float(mesh.norm.vmax),
+                include_zero=True,
+            )
 
-            ax.set_title(f"Feature Loadings (Top {df_load.shape[1]} PCs)")
-            ax.set_xlabel("Principal Component")
-            ax.set_ylabel("Features")
-            ax.tick_params(axis="x", labelrotation=0)
-            ax.tick_params(axis="y", labelrotation=0)
+            style_axis(
+                ax,
+                title="Loadings",
+                xlabel="Principal component",
+                ylabel="Features",
+                xrotation=0,
+                yrotation=0,
+            )
 
             save_plot(fig, stage_dir, "vis_stage7_pca_loadings_heatmap.png")
     else:
         print("  [Info] Stage 7 pca_loadings.csv not found (skip loadings heatmap).")
 
     # ------------------------------------------------------------------
-    # 1) PCA Scatter: PC1 vs PC2 colored by cluster
+    # 1) PCA diagnostic projection colored by K-means cluster
     # ------------------------------------------------------------------
     if {"PC1", "PC2", "cluster"}.issubset(df.columns):
-        fig, ax = plt.subplots(figsize=(10, 8))
+        fig, ax = plt.subplots(figsize=get_figsize("PANEL_ASYM_LEFT"))
 
         # cluster as category for stable coloring
         df_scatter = df.copy()
@@ -2709,15 +4526,7 @@ def vis_stage7(gdf):
         except Exception:
             _clusters_sorted = sorted([str(x) for x in _clusters])
 
-        _cmap_name = "tab10" if len(_clusters_sorted) <= 10 else "tab20"
-        _cmap = plt.get_cmap(_cmap_name)
-        if hasattr(_cmap, "colors"):
-            _color_list = list(_cmap.colors)
-        else:
-            _color_list = [_cmap(i / max(1, (len(_clusters_sorted) - 1))) for i in range(len(_clusters_sorted))]
-        cluster_color_map = {
-            c: _color_list[i % len(_color_list)] for i, c in enumerate(_clusters_sorted)
-        }
+        cluster_color_map = _stage7_cluster_color_map(_clusters_sorted)
 
         sns.scatterplot(
             data=df_scatter,
@@ -2726,15 +4535,123 @@ def vis_stage7(gdf):
             hue="cluster",
             palette=cluster_color_map,
             hue_order=_clusters_sorted,
-            s=50,
+            s=24,
             ax=ax,
             linewidth=0.0,
+            alpha=0.50,
         )
-        ax.set_title("Census Tract Typology Clusters (PC1 vs PC2)", fontsize=16, fontweight="bold")
-        ax.set_xlabel("PC1")
-        ax.set_ylabel("PC2")
-        ax.legend(title="Cluster", loc="best", framealpha=0.95)
-        save_plot(fig, stage_dir, "vis_stage7_scatter.png")
+        style_axis(
+            ax,
+            title="PCA projection colored by cluster",
+            xlabel=_pc_axis_label("PC1"),
+            ylabel=_pc_axis_label("PC2"),
+            title_pad=2.5,
+            title_size=FS_LABEL,
+            title_weight="normal",
+        )
+        ax.grid(True, alpha=0.28)
+        fig.subplots_adjust(bottom=0.30)
+        _add_inline_cluster_legend(
+            ax,
+            _clusters_sorted,
+            cluster_color_map,
+            bbox_to_anchor=(0.5, -0.23),
+        )
+        save_plot(fig, stage_dir, "vis_stage7_pca_kmeans_scatter.png")
+
+        if {"PC1", "PC2", "PC3"}.issubset(df_scatter.columns):
+            fig = plt.figure(figsize=get_figsize("COMPOSITE_MEDIUM"))
+            ax = fig.add_subplot(111, projection="3d")
+
+            for clu in _clusters_sorted:
+                df_clu = df_scatter.loc[df_scatter["cluster"] == clu]
+                ax.scatter(
+                    df_clu["PC1"],
+                    df_clu["PC2"],
+                    df_clu["PC3"],
+                    s=13,
+                    alpha=0.42,
+                    color=cluster_color_map[clu],
+                    linewidths=0.0,
+                    depthshade=False,
+                    label=clu,
+                )
+
+            ax.set_title("PCA projection colored by cluster", fontsize=FS_LABEL, fontweight="normal", pad=4.0)
+            ax.set_xlabel("")
+            ax.set_ylabel("")
+            ax.set_zlabel("")
+            ax.text2D(
+                0.24,
+                0.09,
+                _pc_axis_label("PC1"),
+                transform=ax.transAxes,
+                rotation=-12,
+                va="top",
+                ha="center",
+                fontsize=FS_LABEL,
+            )
+            ax.text2D(
+                0.89,
+                0.07,
+                _pc_axis_label("PC2"),
+                transform=ax.transAxes,
+                rotation=33,
+                va="center",
+                ha="center",
+                fontsize=FS_LABEL,
+            )
+            ax.text2D(
+                1.08,
+                0.53,
+                _pc_axis_label("PC3"),
+                transform=ax.transAxes,
+                rotation=90,
+                va="center",
+                ha="left",
+                fontsize=FS_LABEL,
+            )
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+            ax.zaxis.set_major_locator(MaxNLocator(nbins=5))
+            ax.tick_params(axis="x", which="major", labelsize=FS_TICK, pad=1)
+            ax.tick_params(axis="y", which="major", labelsize=FS_TICK, pad=1)
+            ax.tick_params(axis="z", which="major", labelsize=FS_TICK, pad=1)
+            ax.view_init(elev=22, azim=-58)
+            ax.grid(True, alpha=0.25)
+
+            legend_handles = [Line2D([], [], linestyle="None", label="Cluster")]
+            legend_handles.extend(
+                [
+                    Line2D(
+                        [],
+                        [],
+                        linestyle="None",
+                        marker="o",
+                        markersize=5.0,
+                        markerfacecolor=cluster_color_map[clu],
+                        markeredgecolor=cluster_color_map[clu],
+                        alpha=0.75,
+                        label=str(clu),
+                    )
+                    for clu in _clusters_sorted
+                ]
+            )
+            legend = ax.legend(
+                handles=legend_handles,
+                labels=[handle.get_label() for handle in legend_handles],
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.15),
+                ncol=len(legend_handles),
+                frameon=False,
+                handlelength=0.9,
+                handletextpad=0.35,
+                columnspacing=0.8,
+                borderaxespad=0.0,
+            )
+            format_legend(legend)
+            fig.subplots_adjust(left=0.03, right=0.90, bottom=0.24, top=0.93)
+            save_plot(fig, stage_dir, "vis_stage7_pca_kmeans_scatter_3d.png")
     else:
         print("  [Stage 7] PC1/PC2 or cluster missing, skip scatter.")
 
@@ -2746,7 +4663,7 @@ def vis_stage7(gdf):
     else:
         try:
             g_map = gdf.copy()
-            g_map["tract_id"] = _norm_tract_id(g_map["tract_id"])
+            g_map["tract_id"] = _canonical_tract_fips11(g_map["tract_id"])
 
             df_map = df[["tract_id", "cluster"]].copy()
             df_map["cluster"] = df_map["cluster"].astype(str)
@@ -2759,13 +4676,7 @@ def vis_stage7(gdf):
                 except Exception:
                     _clusters_sorted = sorted([str(x) for x in _clusters])
 
-                _cmap_name = "tab10" if len(_clusters_sorted) <= 10 else "tab20"
-                _cmap = plt.get_cmap(_cmap_name)
-                if hasattr(_cmap, "colors"):
-                    _color_list = list(_cmap.colors)
-                else:
-                    _color_list = [_cmap(i / max(1, (len(_clusters_sorted) - 1))) for i in range(len(_clusters_sorted))]
-                cluster_color_map = {c: _color_list[i % len(_color_list)] for i, c in enumerate(_clusters_sorted)}
+                cluster_color_map = _stage7_cluster_color_map(_clusters_sorted)
 
             merged = g_map.merge(df_map, on="tract_id", how="left")
 
@@ -2793,10 +4704,7 @@ def vis_stage7(gdf):
             )
             merged_plot["_cluster_code"] = merged_plot["_cluster_cat"].cat.codes  # -1 for NaN
 
-            cmap_name = "tab10" if n_clusters <= 10 else "tab20"
-            cmap = plt.get_cmap(cmap_name, n_clusters)
-
-            fig, ax = plt.subplots(figsize=(10, 10))
+            fig, ax = plt.subplots(figsize=get_figsize("PANEL_MAP_TALL"))
 
             # plot missing only within in_stage subset (usually tract_id join mismatch)
             missing = merged_plot[merged_plot["_cluster_code"] < 0]
@@ -2819,6 +4727,16 @@ def vis_stage7(gdf):
                     zorder=1,
                 )
 
+            hotspot_plot = merged_plot.loc[merged_plot["tract_id"].isin(hotspot_ids)].copy()
+            if not hotspot_plot.empty:
+                hotspot_plot.boundary.plot(
+                    ax=ax,
+                    color=STAGE7_HOTSPOT_COLOR,
+                    linewidth=1.35,
+                    alpha=0.96,
+                    zorder=3,
+                )
+
             bounds_src = observed if not observed.empty else merged_plot
             minx, miny, maxx, maxy = bounds_src.total_bounds
             pad_x = (maxx - minx) * 0.03
@@ -2828,25 +4746,42 @@ def vis_stage7(gdf):
             ax.set_aspect("equal")
 
             # manual legend (discrete)
-            import matplotlib.patches as mpatches
             handles = [
                 mpatches.Patch(color=cluster_color_map[str(c)], label=str(c))
                 for c in _clusters_sorted
             ]
             if not missing.empty:
                 handles.append(mpatches.Patch(color="lightgrey", label="Missing"))
+            if not hotspot_plot.empty:
+                handles.append(
+                    mlines.Line2D(
+                        [],
+                        [],
+                        color=STAGE7_HOTSPOT_COLOR,
+                        linewidth=1.35,
+                        label="Recovery-vulnerability hotspots (Top 10)",
+                    )
+                )
 
-            ax.legend(
+            legend = ax.legend(
                 handles=handles,
-                title="Cluster",
-                loc="lower left",
-                framealpha=0.95,
-                fontsize=11,
-                title_fontsize=12,
+                title=None,
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.035),
+                frameon=False,
+                ncol=min(len(handles), 5),
+                borderpad=0.08,
+                labelspacing=0.25,
+                columnspacing=0.9,
+                handletextpad=0.35,
+                handlelength=1.25,
+                borderaxespad=0.0,
             )
+            format_legend(legend)
 
-            ax.set_title("Tract Typology Clusters Map", fontsize=16, fontweight="bold", pad=10)
+            style_axis(ax, title="Clusters")
             ax.axis("off")
+            fig.subplots_adjust(left=0.02, right=0.98, top=0.91, bottom=0.14)
 
             save_plot(fig, stage_dir, "vis_stage7_map_clusters.png")
 
@@ -2854,191 +4789,134 @@ def vis_stage7(gdf):
             print(f"  [Stage 7] Failed to draw cluster map: {e}")
 
     # ------------------------------------------------------------------
-    # 3) Heatmap of cluster feature profiles (Z-score across clusters)
+    # 3) Heatmap of cluster feature profiles (compact outward-facing theme)
     # ------------------------------------------------------------------
-    # Convert numeric-like strings to numeric where relevant
+    df = _attach_stage7_svi_score(df)
     numeric_candidates = [c for c in df.columns if c not in ["tract_id", "cluster"]]
     _to_numeric_inplace(df, numeric_candidates)
 
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    feat_cols = [c for c in STAGE7_SELECTED_THEME_FEATURES if c in numeric_cols]
+    missing_cols = sorted(set(STAGE7_SELECTED_THEME_FEATURES) - set(feat_cols))
+    if missing_cols:
+        print(f"  [Stage 7] compact theme missing columns (skipped): {missing_cols}")
 
-    # ignore
-    cols_ignore = {
-        "tract_id",
-        "cluster",
-        "scenario",
-        "time_hr",
-        "T50",
-        "Redundancy_MaxShare",
-        "N_subs",
-    }
-    cols_ignore |= {c for c in numeric_cols if str(c).startswith("PC")}
-
-    # prioritized feature groups
-    phys_feats = ["T80", "AUC", "Init_Supply"]
-    grid_feats = [
-        "Grid_Centrality",
-        "Grid_ImpactLambda2",
-        "Grid_Betweenness",
-        "Redundancy_HHI",
-    ]
-    built_feats = ["Pre_1970_Ratio", "Pop_Density"]
-
-    svi_feats = [c for c in ["SVI_THEME1", "SVI_THEME2", "SVI_THEME3", "SVI_THEME4"] if c in numeric_cols]
-    nri_feats = [c for c in ["NRI_RISK_SCORE", "NRI_EAL_SCORE", "NRI_BUILDVALUE"] if c in numeric_cols]
-
-    ordered_feats = []
-    for group in [phys_feats, grid_feats, built_feats, svi_feats, nri_feats]:
-        for c in group:
-            if c in numeric_cols and c not in cols_ignore and c not in ordered_feats:
-                ordered_feats.append(c)
-
-    # append remaining numeric cols
-    for c in numeric_cols:
-        if c not in cols_ignore and c not in ordered_feats:
-            ordered_feats.append(c)
-
-    feat_cols = ordered_feats
     if not feat_cols:
         print("  [Stage 7] No valid numeric feature columns for heatmap/KDE.")
         return
 
-    print(f"  Generating Heatmap for features (n={len(feat_cols)}).")
+    print(f"  [Stage 7] Compact theme active with variables: {feat_cols}")
 
     try:
         grp = df.groupby("cluster")[feat_cols].mean()
-
-        # Z-score across clusters for each feature
         mu = grp.mean(axis=0)
         sd = grp.std(axis=0).replace(0, 1.0)
         grp_z = (grp - mu) / sd
 
-        # readability controls
-        n_feat = grp_z.shape[1]
-        n_clu = grp_z.shape[0]
-        show_annot = (n_feat <= 18 and n_clu <= 12)
-
-        fig_h = max(6, 0.35 * n_feat)
-        fig_w = max(10, 0.8 * n_clu + 6)
-
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        fig_height_cm = max(PANEL_ASYM_LEFT["height_cm"], 0.9 * grp_z.shape[1] + 3.0)
+        fig_width_cm = max(PANEL_ASYM_LEFT["width_cm"], 1.0 * grp_z.shape[0] + 8.0)
+        fig, ax = plt.subplots(
+            figsize=get_figsize(
+                "PANEL_ASYM_LEFT",
+                width_cm=fig_width_cm,
+                height_cm=fig_height_cm,
+            )
+        )
         sns.heatmap(
             grp_z.T,
             cmap="coolwarm",
-            center=0,
-            annot=show_annot,
+            center=0.0,
+            annot=grp_z.shape[0] <= 8,
             fmt=".1f",
+            cbar_kws={"label": "Profile z-score"},
             ax=ax,
         )
-
-        # Use prettier (longer) variable names and wrap so they are not truncated
-        _feat_labels = []
-        for _f in grp_z.T.index.tolist():
-            _label = PRETTY_VAR_NAMES.get(str(_f), str(_f))
-            _feat_labels.append(textwrap.fill(_label, width=34))
-        ax.set_yticklabels(_feat_labels, rotation=0)
-        ax.tick_params(axis="y", labelsize=10)
-        ax.tick_params(axis="x", labelsize=11)
-        fig.subplots_adjust(left=0.38)
-
-        ax.set_title(
-            "Cluster Feature Profiles (Z-score across clusters)",
-            fontsize=16,
-            fontweight="bold",
-            pad=10,
+        mesh = ax.collections[0]
+        style_colorbar_with_endpoints(
+            mesh.colorbar,
+            float(mesh.norm.vmin),
+            float(mesh.norm.vmax),
+            include_zero=True,
         )
-        ax.set_xlabel("Cluster")
-        ax.set_ylabel("Feature")
+        ax.set_yticklabels(
+            [textwrap.fill(PRETTY_VAR_NAMES.get(str(f), str(f)), width=32) for f in grp_z.T.index.tolist()],
+            rotation=0,
+        )
+        fig.subplots_adjust(left=0.36)
+        style_axis(
+            ax,
+            title="Profiles",
+            xlabel="Cluster",
+            ylabel="Feature",
+        )
         save_plot(fig, stage_dir, "vis_stage7_heatmap.png")
     except Exception as e:
         print(f"  [Stage 7] Heatmap failed: {e}")
 
     # ------------------------------------------------------------------
-    # 4) KDE Profiles (Facet)
+    # 4) KDE Profiles (compact companion set)
     # ------------------------------------------------------------------
-    kde_target_feats = [
-        "T80",
-        "Init_Supply",
-        "Grid_Centrality",
-        "Redundancy_HHI",
-        "Pre_1970_Ratio",
-        "Pop_Density",
-        "SVI_THEME1",
-        "SVI_THEME2",
-        "SVI_THEME3",
-        "SVI_THEME4",
-        "NRI_RISK_SCORE",
-        "NRI_EAL_SCORE",
-        "NRI_BUILDVALUE",
-    ]
-
-    valid_kde_cols = [c for c in kde_target_feats if c in df.columns]
-    missing_cols = sorted(set(kde_target_feats) - set(valid_kde_cols))
-    if missing_cols:
-        print(f"  [Stage 7] Missing KDE columns (skipped): {missing_cols}")
-
-    if not valid_kde_cols:
-        print("  [Stage 7] No valid columns found for KDE profiles.")
-        return
-
     df_plot = df.copy()
     df_plot["cluster"] = df_plot["cluster"].astype(str)
     clusters_order = sorted(df_plot["cluster"].dropna().unique())
+    log1p_cols = {"Pop_Density", "NRI_BUILDVALUE"}
+    bounded_cols = {"Pre_1970_Ratio"}
 
-    # --- (A) feature handling rules ---
-    log1p_cols = {"Pop_Density", "NRI_BUILDVALUE"}  # long-tail
-    bounded_01_cols = {
-        "Init_Supply",
-        "SVI_THEME1", "SVI_THEME2", "SVI_THEME3", "SVI_THEME4",
-        "Pre_1970_Ratio",
-        "Redundancy_HHI",
-    }
+    def _compact_log_tick_spec(feature: str):
+        """Return compact tick positions and labels for log-transformed feature panels."""
+        if feature == "Pop_Density":
+            return np.log1p([0, 10_000, 100_000]), ["0", "10k", "100k"]
+        if feature == "NRI_BUILDVALUE":
+            return np.log1p([1_000_000, 100_000_000, 1_000_000_000]), ["1M", "100M", "1B"]
+        return None, None
 
-    # Precompute transformed columns (log1p)
-    for c in valid_kde_cols:
+    for c in feat_cols:
+        df_plot[c] = pd.to_numeric(df_plot[c], errors="coerce")
         if c in log1p_cols:
-            # clip to >=0 then log1p (robust to zeros)
-            df_plot[f"{c}__log1p"] = np.log1p(pd.to_numeric(df_plot[c], errors="coerce").clip(lower=0))
+            df_plot[f"{c}__log1p"] = np.log1p(df_plot[c].clip(lower=0))
 
-    # --- (B) add cluster n into legend labels (global n, stable across subplots) ---
     cluster_counts = df_plot["cluster"].value_counts(dropna=True).to_dict()
-    df_plot["cluster_label"] = df_plot["cluster"].map(lambda s: f"{s} (n={cluster_counts.get(s, 0)})")
-
+    df_plot["cluster_label"] = df_plot["cluster"].map(lambda c: f"{c} (n={cluster_counts.get(c, 0)})")
     clusters_label_order = [f"{c} (n={cluster_counts.get(c, 0)})" for c in clusters_order]
     cluster_label_palette = {
         f"{c} (n={cluster_counts.get(c, 0)})": cluster_color_map.get(c, None)
         for c in clusters_order
     }
 
-    n_vars = len(valid_kde_cols)
     n_cols = 3
-    n_rows = math.ceil(n_vars / n_cols)
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 5, n_rows * 3.5))
+    n_rows = math.ceil(len(feat_cols) / n_cols)
+    fig_height_cm = max(COMPOSITE_FULL_DENSE["height_cm"], 3.1 * n_rows + 1.5)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=get_figsize("COMPOSITE_FULL_DENSE", height_cm=fig_height_cm),
+    )
     axes = np.atleast_1d(axes).flatten()
 
-    last_i = -1
-    for i, col in enumerate(valid_kde_cols):
-        last_i = i
-        ax = axes[i]
-
-        # choose x variable (log1p for heavy-tail)
+    last_used = -1
+    for idx, col in enumerate(feat_cols):
+        last_used = idx
+        ax = axes[idx]
         x_col = f"{col}__log1p" if col in log1p_cols else col
-        x_label = f"{col} (log1p)" if col in log1p_cols else col
+        panel_title = PRETTY_VAR_NAMES.get(col, col)
+        if col in log1p_cols:
+            panel_title = f"{panel_title} (log axis)"
 
-        # bounded [0,1] -> prefer KDE but constrained to [0,1] (no leakage)
-        if col in bounded_01_cols:
+        kde_kwargs = {
+            "data": df_plot,
+            "x": x_col,
+            "hue": "cluster_label",
+            "hue_order": clusters_label_order,
+            "common_norm": False,
+            "fill": False,
+            "linewidth": 2.0,
+            "palette": cluster_label_palette,
+            "ax": ax,
+            "warn_singular": False,
+        }
+        if col in bounded_cols:
             sns.kdeplot(
-                data=df_plot,
-                x=x_col,
-                hue="cluster_label",
-                hue_order=clusters_label_order,
-                common_norm=False,
-                fill=False,
-                linewidth=2,
-                palette=cluster_label_palette,
-                ax=ax,
-                warn_singular=False,
+                **kde_kwargs,
                 cut=0,
                 clip=(0, 1),
                 bw_adjust=0.7,
@@ -3046,91 +4924,101 @@ def vis_stage7(gdf):
             )
             ax.set_xlim(-0.02, 1.02)
         else:
-            sns.kdeplot(
-                data=df_plot,
-                x=x_col,
-                hue="cluster_label",
-                hue_order=clusters_label_order,
-                common_norm=False,
-                fill=False,
-                linewidth=2,
-                palette=cluster_label_palette,
-                ax=ax,
-                warn_singular=False,
-                bw_adjust=1.0,
+            sns.kdeplot(**kde_kwargs, bw_adjust=1.0)
+
+        for cluster in clusters_order:
+            subset = pd.to_numeric(df_plot.loc[df_plot["cluster"] == cluster, x_col], errors="coerce").dropna()
+            if subset.empty:
+                continue
+            ax.axvline(
+                float(np.median(subset)),
+                color=cluster_color_map.get(cluster, "black"),
+                linestyle="--",
+                linewidth=1.2,
+                alpha=0.9,
             )
 
-        # add per-cluster median & mean vertical lines
-        for c in clusters_order:
-            sub = df_plot[df_plot["cluster"] == c][x_col]
-            sub = pd.to_numeric(sub, errors="coerce").dropna()
-            if sub.empty:
-                continue
-            color = cluster_color_map.get(c, None)
-            med = float(np.median(sub))
-            mu = float(np.mean(sub))
-            ax.axvline(med, color=color, linestyle="--", linewidth=1.2, alpha=0.9)
-            ax.axvline(mu,  color=color, linestyle=":",  linewidth=1.2, alpha=0.9)
-
-        ax.set_title(f"Attribute = {col}", fontweight="bold")
-        ax.set_xlabel(x_label)
-        ax.set_ylabel("Density")
+        style_axis(
+            ax,
+            title=panel_title,
+            xlabel="",
+            ylabel="Density",
+            title_size=FS_LABEL,
+            title_weight="normal",
+        )
+        if col in log1p_cols:
+            tick_positions, tick_labels = _compact_log_tick_spec(col)
+            if tick_positions is not None:
+                ax.set_xticks(tick_positions)
+                ax.set_xticklabels(tick_labels)
         sns.despine(ax=ax)
-
-        # remove legend from every subplot (we'll add a global legend in the empty panel)
         if ax.get_legend() is not None:
             ax.get_legend().remove()
 
-    # keep the first unused axis as legend panel; delete the rest
-    from matplotlib.lines import Line2D
-
     legend_ax = None
-    for j in range(last_i + 1, len(axes)):
+    for idx in range(last_used + 1, len(axes)):
         if legend_ax is None:
-            legend_ax = axes[j]
+            legend_ax = axes[idx]
             legend_ax.axis("off")
         else:
-            fig.delaxes(axes[j])
+            fig.delaxes(axes[idx])
 
-    plt.tight_layout()
-
-    # build legend: cluster lines + stats line styles (median/mean)
-    cluster_handles = []
-    for c in clusters_order:
-        lab = f"{c} (n={cluster_counts.get(c, 0)})"
-        colr = cluster_label_palette.get(lab, None)
-        if colr is None:
-            colr = cluster_color_map.get(c, "black")
-        cluster_handles.append(Line2D([0], [0], color=colr, lw=2, label=lab))
-
-    stat_handles = [
-        Line2D([0], [0], color="black", lw=1.6, linestyle="--", label="Median (--)"),
-        Line2D([0], [0], color="black", lw=1.6, linestyle=":",  label="Mean (:)"),
+    cluster_handles = [
+        Line2D(
+            [0], [0],
+            color=cluster_color_map.get(cluster, "black"),
+            lw=2,
+            label=f"Cluster {cluster} (n={cluster_counts.get(cluster, 0)})",
+        )
+        for cluster in clusters_order
     ]
-
-    handles = cluster_handles + stat_handles
-
+    ref_handle = Line2D([0], [0], color="black", lw=1.6, linestyle="--", label="Dashed lines = cluster median")
     if legend_ax is not None:
-        legend_ax.legend(
-            handles=handles,
-            loc="center",
-            frameon=False,
-            title="cluster label",
-        )
-    else:
-        fig.legend(
-            handles=handles,
-            loc="center right",
-            frameon=False,
-            title="cluster label",
-        )
+        fig.delaxes(legend_ax)
 
+    legend = fig.legend(
+        handles=cluster_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.088),
+        frameon=False,
+        title="Cluster",
+        ncol=2,
+        columnspacing=1.15,
+        handletextpad=0.55,
+        handlelength=1.7,
+        borderaxespad=0.0,
+    )
+    format_legend(legend)
+    if legend.get_title() is not None:
+        legend.get_title().set_fontsize(FS_LEGEND + 0.6)
+    for text in legend.get_texts():
+        text.set_fontsize(FS_LEGEND + 0.4)
+
+    ref_legend = fig.legend(
+        handles=[ref_handle],
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.055),
+        frameon=False,
+        ncol=1,
+        handlelength=1.8,
+        handletextpad=0.5,
+        borderaxespad=0.0,
+    )
+    format_legend(ref_legend)
+    for text in ref_legend.get_texts():
+        text.set_fontsize(FS_LEGEND)
+
+    plt.tight_layout(rect=(0.0, 0.165, 1.0, 1.0))
     save_plot(fig, stage_dir, "vis_stage7_kde_profiles.png")
 
 # ==============================================================================
 # ▶️ Main
 # ==============================================================================
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     print("=========================================")
     print("   ENHANCED VISUALIZATION GENERATOR      ")
     print("=========================================")

@@ -1,0 +1,12 @@
+check_name,computed_value,expected_or_formula,pass
+LADWP raw row sum,1091,427+183+363+47+56+5+10=1091,TRUE
+LADWP weighted denominator,902.400000,427*1+183*1+363*0.6+47*0.8+56*0.5+5*0.8+10*0.5=902.400,TRUE
+LADWP allocation ratio,0.833333333,35/42=0.833333333,TRUE
+LADWP exact crews,46.791111,902.400*0.28*(35/42)/4.5=46.791111,TRUE
+SCE allocation ratio,0.319293478,235/736=0.319293478,TRUE
+SCE exact crews,10.114749,509.119257*0.28*(235/736)/4.5=10.114749,TRUE
+Exact total,56.905860,46.791111+10.114749=56.905860,TRUE
+Integer utility total,57,47+10=57,TRUE
+Yard integer sum,57,sum D01-D16 integer crews=57,TRUE
+LADWP yard integer sum,47,sum LADWP yard crews=47,TRUE
+SCE yard integer sum,10,sum SCE yard crews=10,TRUE

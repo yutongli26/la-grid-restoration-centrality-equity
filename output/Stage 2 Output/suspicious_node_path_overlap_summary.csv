@@ -1,0 +1,7 @@
+node,node_name,degree_payload,unique_path_segments,segments_reused_by_2plus_links,max_segment_reuse_count,max_first_segment_reuse_count,median_link_length_km,max_link_length_km,median_path_nodes_count
+306268,WESTEX,35,1876,754,23,17,24.49,43.55,154.0
+308471,TORRANCE,35,1266,685,21,16,20.62,54.98,113.0
+305084,VICTORIA,33,1189,638,23,19,20.55,54.99,117.0
+301489,BULLIS,30,1461,500,17,17,17.33,35.58,107.0
+308216,ROLLING HILLS,25,1116,602,25,18,22.83,62.55,153.0
+304731,REDONDO,24,971,480,24,21,23.38,56.69,150.5

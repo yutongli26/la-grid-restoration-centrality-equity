@@ -1,5 +1,6 @@
 import os
 import json
+from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 from pyproj import Transformer
@@ -13,12 +14,12 @@ IDW_RADIUS_KM = 11.0
 IDW_RADIUS_M = IDW_RADIUS_KM * 1000.0
 
 # ================= Paths =================
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "Data"
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
 GRID_DIR: str = str(DATA_DIR / "MS_048_CA_pt01_MMI_GM_datafiles")
 
 # 1) Substation file
-SUB_CSV = os.path.join(DATA_DIR, "Los_Angeles_City_SUBSTATION_with_fragility_ORIGINAL.csv")
+SUB_CSV = os.path.join(DATA_DIR, "Los_Angeles_City_SUBSTATION_with_fragility_29.csv")
 
 # 2) Output file
 FINAL_OUTPUT_CSV = os.path.join(DATA_DIR, "Substations_PGA_IDW_CEC.csv")
@@ -50,6 +51,13 @@ COVJSON_VALUES_ARE_LN = None
 # - True  : values are ln(g)
 # - False : values are g and will be converted to ln(g)
 CSV_VALUES_ARE_LN = False
+
+
+@dataclass(frozen=True)
+class IDWConfig:
+    sub_csv: str = SUB_CSV
+    final_output_csv: str = FINAL_OUTPUT_CSV
+    scenarios: dict = field(default_factory=lambda: dict(SCENARIOS))
 
 # ================= Helpers =================
 def _die(msg: str) -> None:
@@ -372,12 +380,14 @@ def load_csv_grid(path: str, col_name: str) -> tuple[np.ndarray, np.ndarray, np.
     return lon, lat, val_ln
 
 # ================= Main =================
-if __name__ == "__main__":
-    print(f"1) Loading substations: {SUB_CSV}")
-    if not os.path.exists(SUB_CSV):
-        _die(f"Substation CSV not found: {SUB_CSV}")
+def main(cfg: IDWConfig | None = None) -> None:
+    cfg = cfg if cfg is not None else IDWConfig()
 
-    subs = pd.read_csv(SUB_CSV)
+    print(f"1) Loading substations: {cfg.sub_csv}")
+    if not os.path.exists(cfg.sub_csv):
+        _die(f"Substation CSV not found: {cfg.sub_csv}")
+
+    subs = pd.read_csv(cfg.sub_csv)
     subs.columns = subs.columns.str.strip()
 
     # Ensure ID
@@ -401,8 +411,8 @@ if __name__ == "__main__":
     # Output container
     result_df = subs[["id"]].copy()
 
-    print(f"2) Scenarios: {len(SCENARIOS)}")
-    for name, (ftype, path, col) in SCENARIOS.items():
+    print(f"2) Scenarios: {len(cfg.scenarios)}")
+    for name, (ftype, path, col) in cfg.scenarios.items():
         print(f"\n--- Scenario: {name} ({ftype}) ---")
         if ftype == "json":
             glon, glat, gln = load_covjson(path)
@@ -427,9 +437,9 @@ if __name__ == "__main__":
         if finite.size > 0:
             print(f"  stats: min={finite.min():.4g}g, p50={np.median(finite):.4g}g, max={finite.max():.4g}g")
 
-    print(f"\n3) Merging and writing: {FINAL_OUTPUT_CSV}")
+    print(f"\n3) Merging and writing: {cfg.final_output_csv}")
 
-    final_df = pd.read_csv(SUB_CSV)
+    final_df = pd.read_csv(cfg.sub_csv)
     final_df.columns = final_df.columns.str.strip()
 
     if "id" not in final_df.columns:
@@ -443,6 +453,10 @@ if __name__ == "__main__":
         final_df.drop(columns=cols_to_drop, inplace=True)
 
     final_df = pd.merge(final_df, result_df, on="id", how="left")
-    final_df.to_csv(FINAL_OUTPUT_CSV, index=False)
+    final_df.to_csv(cfg.final_output_csv, index=False)
 
     print("OK: finished writing output.")
+
+
+if __name__ == "__main__":
+    main()

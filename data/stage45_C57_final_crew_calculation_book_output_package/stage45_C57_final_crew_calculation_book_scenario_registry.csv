@@ -1,0 +1,9 @@
+item,value,status,notes
+exact_scenario_label,C56_9_substation_ratio_exact,retained in audit,Exact total = 56.905860.
+integer_scenario_label,C57_substation_ratio_main,final main,Integer Stage 4/5 scheduling input = 57.
+yard_allocation_label,C57_yard_allocation_no_deletion_tie_coherent_zero_low,final main allocation,No-deletion list; tie-coherent zero-low integer yard allocation.
+LADWP_integer_total,47,final,Derived from 46.791111 rounded at utility level.
+SCE_integer_total,10,final,Derived from 10.114749 rounded at utility level.
+total_integer_crews,57,final,47 + 10 = 57.
+SCE_288_transmission,excluded,sensitivity only,Not included in current substation-ratio main.
+no_deletion_rule,D01-D16 retained,final,Some yards receive 0 integer crews but are not deleted from the documented yard list.

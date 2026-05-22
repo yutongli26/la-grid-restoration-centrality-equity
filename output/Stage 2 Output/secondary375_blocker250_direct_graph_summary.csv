@@ -1,0 +1,2 @@
+secondary_tolerance_m,secondary_ratio_max,secondary_margin_m,blocker_tolerance_m,registered_substations,unsnapped_substations,direct_edges,components,largest_component_nodes,second_component_nodes,second_component_names,isolates,median_degree,max_degree,edges_gt20km,edges_gt25km,max_link_km
+375.0,0.75,75.0,250.0,93,0,363,1,93,0,,0,6.0,24,101,61,53.28326684977264

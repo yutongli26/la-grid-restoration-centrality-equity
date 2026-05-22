@@ -1,0 +1,10 @@
+cutoff_km,edges,components,largest_component,isolates,median_degree,max_degree,bullis_degree,suspicious_degree_ge20,suspicious_names
+16.0,345,1,98,0,6.0,20,13,0,
+17.0,368,1,98,0,6.0,20,14,0,
+18.0,398,1,98,0,7.0,23,18,0,
+19.0,416,1,98,0,7.0,26,20,1,BULLIS
+19.5,425,1,98,0,7.0,27,20,1,BULLIS
+19.9,427,1,98,0,7.0,28,20,1,BULLIS
+20.0,429,1,98,0,7.0,28,20,1,BULLIS
+21.0,452,1,98,0,7.5,29,20,1,BULLIS
+22.0,467,1,98,0,8.0,30,20,3,VICTORIA; TORRANCE; BULLIS

@@ -1,0 +1,93 @@
+substation_id,degree,NAME,CITY,Owner,MAX_VOLT,LINES,role_key,role_text,is_source,source_role_score,MAX_VOLT_N,LINES_N,is_role_hub,is_voltage_hub,is_line_hub,hub_evidence_count,sanity_flag
+302164,20.0,BRIGHTON,GARDENA,SCE,115,2,,,,,115,2,False,False,False,0,suspicious_high_degree_low_hub_evidence
+308471,18.0,TORRANCE,TORRANCE,SCE,66,2,,,,,66,2,False,False,False,0,ok
+303169,17.0,LIGHTPIPE,LONG BEACH,SCE,230,9,transit,transit transit_hub_not_source,False,0.6,230,9,True,True,True,3,ok
+304137,17.0,HALLDALE,LOS ANGELES,LADWP,138,3,,,,,138,3,False,True,False,1,ok
+306844,17.0,LA FRESA,TORRANCE,SCE,230,12,transit,transit transit_hub_not_source,False,0.6,230,12,True,True,True,3,ok
+303540,16.0,CARSON,COMPTON,SCE,66,1,,,,,66,1,False,False,False,0,ok
+306450,16.0,VERNON,VERNON,Other,66,3,,,,,66,3,False,False,False,0,ok
+300232,15.0,CENTER,NORWALK,SCE,230,7,,,,,230,7,False,True,True,2,ok
+310179,15.0,WILMINGTON (STATION C),LOS ANGELES,LADWP,138,8,transit,transit transit_hub_not_source,False,0.6,138,8,True,True,True,3,ok
+308806,15.0,MOBILOIL,TORRANCE,SCE,66,3,,,,,66,3,False,False,False,0,ok
+301614,15.0,PULPGEN,VERNON,Other,66,3,,,,,66,3,False,False,False,0,ok
+306279,15.0,OLINDA,ROWLAND HEIGHTS,SCE,230,10,transit,transit transit_hub_not_source,False,0.6,230,10,True,True,True,3,ok
+306060,14.0,LAGUNA BELL,COMMERCE,SCE,230,12,transit,transit transit_hub_not_source,False,0.6,230,12,True,True,True,3,ok
+309758,14.0,YUKON,HAWTHORNE,SCE,66,5,,,,,66,5,False,False,False,0,ok
+309042,13.0,RIVER,LOS ANGELES,LADWP,230,9,,,,,230,9,False,True,True,2,ok
+304450,13.0,HARBORGEN,LOS ANGELES,SCE,230,4,core,core in_basin_generation_proxy,True,1.0,230,4,True,True,False,2,ok
+300390,12.0,HINSON,LONG BEACH,SCE,230,7,transit,transit transit_hub_not_source,False,0.6,230,7,True,True,True,3,ok
+300105,12.0,WALNUT,INDUSTRY,SCE,230,5,,,,,230,5,False,True,False,1,ok
+300429,11.0,STATION E (TOLUCA),LOS ANGELES,LADWP,500,15,transit,transit transit_hub_not_source,False,0.6,500,15,True,True,True,3,ok
+301105,10.0,STATION K (OLYMPIC),LOS ANGELES,LADWP,230,8,transit,transit transit_hub_not_source,False,0.6,230,8,True,True,True,3,ok
+309156,10.0,FELTON,DEL AIRE,SCE,66,2,,,,,66,2,False,False,False,0,ok
+308786,10.0,LA CIENEGA,LADERA HEIGHTS,SCE,230,3,transit,transit transit_hub_not_source,False,0.6,230,3,True,True,False,2,ok
+301558,10.0,EAGLE ROCK,GLENDALE,SCE,230,9,,,,,230,9,False,True,True,2,ok
+301543,9.0,SEPLUVEDA,EL SEGUNDO,SCE,66,0,,,,,66,0,False,False,False,0,ok
+308494,9.0,AIRWAY,GLENDALE,LADWP,230,6,,,,,230,6,False,True,True,2,ok
+302187,9.0,DEL AMO,CERRITOS,SCE,230,10,transit,transit transit_hub_not_source,False,0.6,230,10,True,True,True,3,ok
+307039,8.0,ALAMITOS,LONG BEACH,SCE,230,7,core,core in_basin_generation_proxy,True,1.0,230,7,True,True,True,3,ok
+300648,8.0,ROSEMEAD,ROSEMEAD,SCE,66,4,,,,,66,4,False,False,False,0,ok
+310199,8.0,SYLMAR WEST,LOS ANGELES,LADWP,230,11,core,core import_interface_proxy,True,1.0,230,11,True,True,True,3,ok
+301637,8.0,STATION N (AIRPORT),LOS ANGELES,LADWP,138,4,,,,,138,4,False,True,False,1,ok
+310204,8.0,EL NIDO,HAWTHORNE,SCE,230,7,transit,transit transit_hub_not_source,False,0.6,230,7,True,True,True,3,ok
+306369,8.0,LA MIRADA,LA MIRADA,SCE,66,1,,,,,66,1,False,False,False,0,ok
+301194,7.0,STATION G (ATWATER),LOS ANGELES,LADWP,230,8,,,,,230,8,False,True,True,2,ok
+302297,7.0,TRISONIC,EL SEGUNDO,SCE,66,1,,,,,66,1,False,False,False,0,ok
+307564,7.0,JOSE,AVOCADO HEIGHTS,SCE,66,0,,,,,66,0,False,False,False,0,ok
+306224,7.0,LAKEWOOD,LONG BEACH,SCE,66,2,,,,,66,2,False,False,False,0,ok
+305984,7.0,RIO HONDO,IRWINDALE,SCE,230,8,core,core import_interface_proxy,True,1.0,230,8,True,True,True,3,ok
+309663,7.0,TAHITI,MARINA DEL REY,SCE,230,1,,,,,230,1,False,True,False,1,ok
+303371,7.0,GOODRICH,PASADENA,SCE,230,5,,,,,230,5,False,True,False,1,ok
+308907,7.0,NEWMARK,MONTEREY PARK,SCE,66,3,transit,transit transit_hub_not_source,False,0.6,66,3,True,False,False,1,ok
+306091,6.0,DOUGLAS,EL SEGUNDO,SCE,66,1,,,,,66,1,False,False,False,0,ok
+310504,6.0,BANDINI,VERNON,SCE,66,2,,,,,66,2,False,False,False,0,ok
+301745,6.0,WINDSOR HILLS,VIEW PARK-WINDSOR HILLS,SCE,66,0,transit,transit transit_hub_not_source,False,0.6,66,0,True,False,False,1,ok
+301100,6.0,UNKNOWN301100,LOS ANGELES,LADWP,230,1,transit,transit transit_hub_not_source,False,0.6,230,1,True,True,False,2,ok
+306489,6.0,SYLMAR EAST,LOS ANGELES,LADWP,230,1,core,core import_interface_proxy,True,1.0,230,1,True,True,False,2,ok
+308269,6.0,STATION F (VELASCO & KINETIC),LOS ANGELES,LADWP,230,7,transit,transit transit_hub_not_source,False,0.6,230,7,True,True,True,3,ok
+301541,6.0,MESA,MONTEREY PARK,SCE,230,9,core,core import_interface_proxy,True,1.0,230,9,True,True,True,3,ok
+301156,6.0,BEVERLY,BEVERLY HILLS,SCE,66,4,,,,,66,4,False,False,False,0,ok
+307693,6.0,RINALDI,LOS ANGELES,LADWP,500,16,core,core import_interface_proxy,True,1.0,500,16,True,True,True,3,ok
+302171,6.0,SAWTELLE,LOS ANGELES,SCE,66,2,,,,,66,2,False,False,False,0,ok
+309569,6.0,STATION M(VALLEY),LOS ANGELES,LADWP,230,7,core,core in_basin_generation_proxy,True,1.0,230,7,True,True,True,3,ok
+307785,5.0,WABASH,EAST LOS ANGELES,SCE,69,4,,,,,69,4,False,False,False,0,ok
+309703,5.0,EL SEGUNDO,EL SEGUNDO,SCE,230,2,core,core in_basin_generation_proxy,True,1.0,230,2,True,True,False,2,ok
+300558,5.0,GANESHA,POMONA,SCE,66,5,,,,,66,5,False,False,False,0,ok
+302798,5.0,REPETTO,MONTEREY PARK,SCE,66,2,transit,transit transit_hub_not_source,False,0.6,66,2,True,False,False,1,ok
+304073,5.0,STATION B (CENTURY),LOS ANGELES,LADWP,230,8,transit,transit transit_hub_not_source,False,0.6,230,8,True,True,True,3,ok
+306768,4.0,UNKNOWN306768,LOS ANGELES,0.0,230,0,,,,,230,0,False,True,False,1,ok
+301636,4.0,SAN FERNANDO,LOS ANGELES,SCE,66,1,,,,,66,1,False,False,False,0,ok
+303344,4.0,CHEVGEN,EL SEGUNDO,SCE,66,2,,,,,66,2,False,False,False,0,ok
+300408,4.0,PUENTE,INDUSTRY,SCE,66,5,,,,,66,5,False,False,False,0,ok
+306444,4.0,STANHILL,LADERA HEIGHTS,SCE,66,0,,,,,66,0,False,False,False,0,ok
+301108,4.0,CHEVMAIN,EL SEGUNDO,SCE,230,5,,,,,230,5,False,True,False,1,ok
+307373,4.0,HAYNES,LONG BEACH,LADWP,230,6,core,core in_basin_generation_proxy,True,1.0,230,6,True,True,True,3,ok
+300829,4.0,GOULD,LA CA?ADA FLINTRIDGE,SCE,230,2,core,core import_interface_proxy,True,1.0,230,2,True,True,False,2,ok
+309553,4.0,STATION L (SCATTERGOOD),LOS ANGELES,LADWP,230,2,core,core in_basin_generation_proxy,True,1.0,230,2,True,True,False,2,ok
+307512,3.0,GRAYSON,GLENDALE,Other,230,2,,,,,230,2,False,True,False,1,ok
+309853,3.0,DOCK,LONG BEACH,SCE,66,2,,,,,66,2,False,False,False,0,ok
+306623,3.0,GRAMERCY,LOS ANGELES,LADWP,138,6,transit,transit transit_hub_not_source,False,0.6,138,6,True,True,True,3,ok
+303099,3.0,STATION D (FAIRFAX),LOS ANGELES,LADWP,138,8,transit,transit transit_hub_not_source,False,0.6,138,8,True,True,True,3,ok
+300627,3.0,IMPERIAL TERMINAL TOWER,WEST ATHENS,LADWP,138,4,transit,transit transit_hub_not_source,False,0.6,138,4,True,True,False,2,ok
+303620,3.0,TARZANA(STATION U),LOS ANGELES,LADWP,230,7,transit,transit transit_hub_not_source,False,0.6,230,7,True,True,True,3,ok
+302923,3.0,UNKNOWN302923,EL SEGUNDO,SCE,66,1,,,,,66,1,False,False,False,0,ok
+310527,3.0,STATION A (ST. JOHN),LOS ANGELES,LADWP,230,5,transit,transit transit_hub_not_source,False,0.6,230,5,True,True,False,2,ok
+303899,2.0,STATION H (HOLLYWOOD),LOS ANGELES,LADWP,230,4,,,,,230,4,False,True,False,1,ok
+308367,2.0,FUEL,LONG BEACH,SCE,230,1,,,,,230,1,False,True,False,1,ok
+300493,2.0,STATION J,LOS ANGELES,LADWP,230,4,,,,,230,4,False,True,False,1,ok
+308206,2.0,NICHOLS CANYON,LOS ANGELES,LADWP,230,3,transit,transit transit_hub_not_source,False,0.6,230,3,True,True,False,2,ok
+308581,2.0,STATION Q (HARBOR),LOS ANGELES,LADWP,138,3,core,core in_basin_generation_proxy,True,1.0,138,3,True,True,False,2,ok
+309843,2.0,KENTER CANYON,LOS ANGELES,LADWP,230,2,transit,transit transit_hub_not_source,False,0.6,230,2,True,True,False,2,ok
+307274,2.0,CAMERON,LONG BEACH,SCE,69,1,,,,,69,1,False,False,False,0,ok
+307557,2.0,ROSECRANS,EL SEGUNDO,SCE,66,1,,,,,66,1,False,False,False,0,ok
+301517,2.0,NOGALES,INDUSTRY,SCE,66,0,,,,,66,0,False,False,False,0,ok
+307832,2.0,UNKNOWN307832,MANHATTAN BEACH,SCE,230,0,,,,,230,0,False,True,False,1,ok
+306694,1.0,COLORADO,SANTA MONICA,SCE,66,2,,,,,66,2,False,False,False,0,ok
+306365,1.0,ARCOGEN,CARSON,SCE,230,2,,,,,230,2,False,True,False,1,ok
+305885,1.0,LA BREA,VIEW PARK-WINDSOR HILLS,LADWP,138,8,,,,,138,8,False,True,True,2,ok
+303303,1.0,HUGHTRON,TORRANCE,SCE,66,1,,,,,66,1,False,False,False,0,ok
+305780,1.0,THERMAS,EL SEGUNDO,SCE,66,0,,,,,66,0,False,False,False,0,ok
+308991,1.0,STATION T,LOS ANGELES,LADWP,230,3,,,,,230,3,False,True,False,1,ok
+304040,1.0,ARROYO,LA CA?ADA FLINTRIDGE,SCE,66,1,,,,,66,1,False,False,False,0,ok
+308540,1.0,LONG BEACH,LONG BEACH,SCE,230,4,core,core in_basin_generation_proxy,True,1.0,230,4,True,True,False,2,ok
+301214,1.0,OLIVE,LOS ANGELES,LADWP,230,2,,,,,230,2,False,True,False,1,ok

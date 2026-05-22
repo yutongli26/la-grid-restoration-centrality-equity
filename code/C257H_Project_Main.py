@@ -27,47 +27,37 @@ LA power grid. It covers:
 - Stage 4:   Rule-Based Scheduling Baselines
 - Stage 5:   GA-Based Scheduling Optimization
 - Stage 6:   Consolidation, KPI Calculation & Plotting
-- Stage 7:   Tract-Level Typology (PCA + K-Means)
+- Stage 7:   Tract-Level Typology (K-Means + PCA Diagnostics)
 """
 
 # --- Standard library imports -------------------------------------------------
 import logging
-import math
 import os
 import sys
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+import zlib
 
 # --- Third-party imports ------------------------------------------------------
-import geopandas as gpd
 import matplotlib
-import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
-import seaborn as sns
 from geopy.distance import geodesic
 from joblib import Parallel, delayed
 from scipy.stats import lognorm
-from shapely.geometry import Point
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.neighbors import kneighbors_graph
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import norm
-
-# 
-from scipy.spatial import cKDTree
-from shapely import wkt
-from shapely.geometry import Point, LineString, MultiPoint, MultiLineString, box
-from shapely.ops import split, snap
 import random
 from deap import base, creator, tools, algorithms
 
 # --- GLOBAL LOG STORE ---
 GLOBAL_GANTT_LOG = []
+_TIMESTAMPED_BACKUPS_CREATED = set()
 
 # Configure Matplotlib for headless environments (kept in-place)
 matplotlib.use("Agg")
@@ -75,14 +65,14 @@ matplotlib.use("Agg")
 # =========================
 # Project paths (portable)
 # =========================
-# Project root is the directory containing this script.
-PROJECT_ROOT = Path(__file__).resolve().parent
+# Project root is the repository root; this script lives under ./code.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# All input files are stored under ./Data.
-DATA_DIR = PROJECT_ROOT / "Data"
+# All input files are stored under ./data.
+DATA_DIR = PROJECT_ROOT / "data"
 
-# Outputs are written under the project root by default (Stage X Output folders).
-DEFAULT_OUTPUT_ROOT = PROJECT_ROOT
+# Outputs are written under ./output by default (Stage X Output folders).
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "output"
 OUTPUT_ROOT = str(DEFAULT_OUTPUT_ROOT)
 
 # === Enforce stepwise I/O helpers =============================================
@@ -103,27 +93,32 @@ class Config:
     MAP_TRACT_SUB_CSV: str = str(DATA_DIR / "tract_to_substation_mapping_CEC.csv")
     CEC_GRAPH_EDGES_CSV: str = str(DATA_DIR / "substation_graph_CEC_edges.csv")
     CEC_GRAPH_NODES_CSV: str = str(DATA_DIR / "substation_graph_CEC_nodes.csv")
-    LA_TRACTS_PATH: str = str(DATA_DIR / "LA_Tracts_With_Population.shp")
     HOSPITAL_TRACTS_CSV: str = str(DATA_DIR / "hospital_with_tract.csv")
+    SOURCE_NODES_CSV: str = str(DATA_DIR / "source_nodes_core.csv")
     STAGE7_SVI_DATA_PATH: str = str(DATA_DIR / "California.csv")
     STAGE7_NRI_DATA_PATH: str = str(DATA_DIR / "NRI_Table_CensusTracts_California.csv")
     STAGE7_HOUSING_DATA_PATH: str = str(DATA_DIR / "ACSDT5Y2022.B25034-Data.csv")
 
-    # --- Social Vulnerability Index (tract-level, optional)
+    # --- Social Vulnerability Index (tract-level)
     SVI_CSV: str = str(DATA_DIR / "LA_Census_Tracts_SOVI_Scores_with_Identifiers.csv")
     SVI_GEOID_COL: str = "TRACTFIPS"
     SVI_VALUE_COL: str = "SOVI_SCORE"
-    SVI_FLOW_WEIGHT: float = 1.0
-
-    # --- Transmission line shapefile (CEC real network)
-    TRANSMISSION_LINES_SHP: str = str(DATA_DIR / "TransmissionLine_CEC.shp")
-    MAX_LINE_ENDPOINT_DIST_KM: float = 0.5  # Endpoint matching radius
+    W_SVI: float = 1.0
 
     # --- Travel Time Inputs
     # Precomputed travel times conceptually live with Stage 4.
     TRAVEL_BASE_TO_TASK_CSV: str = stage_file("4", "travel_base_to_task.csv")
     TRAVEL_TASK_TO_TASK_CSV: str = stage_file("4", "travel_task_to_task.csv")
     VIRTUAL_VEL_KMH = 30.0  # Virtual travel speed for unconnected pairs
+
+    # --- Stage 4/5 C57 depot and crew-origin inputs
+    STAGE45_DEPOT_INPUT_CSV: str = str(DATA_DIR / "stage45_depot_inputs_final_origin_proxy.csv")
+    STAGE45_C57_SCENARIO_LABEL: str = "C57_substation_ratio_main"
+    STAGE45_C57_ALLOCATION_LABEL: str = "C57_yard_allocation_no_deletion_tie_coherent_zero_low"
+    STAGE45_C57_TOTAL_EXACT: float = 56.905860
+    STAGE45_ACTIVE_CREW_BASES_CSV: str = str(DATA_DIR / "stage45_active_crew_bases_C57.csv")
+    STAGE45_ALL_DEPOT_AUDIT_CSV: str = str(DATA_DIR / "stage45_all_depot_crew_inputs_C57_audit.csv")
+    STAGE45_EXPANDED_CREW_ORIGINS_CSV: str = str(DATA_DIR / "stage45_C57_expanded_crew_origins.csv")
 
     # =========================================================================
     # OUTPUT DIRS (Relative to output root; follow the staged workflow naming)
@@ -145,23 +140,26 @@ class Config:
     SUPPLY_THRESH: float = 0.8
     DT_HR: float = 0.05
     N_MC: int = 1000  # Number of MC samples per scenario
-    UNDAMAGED_EPS_HR: float = 0.5     # Treat repair time <= eps as undamaged
     FUNCTIONAL_THRESHOLD: float = 0.5  # Substation functional if value >= threshold
+    SOURCE_GATE_ENABLED: bool = True  # Require functional substations to connect to an active source island
+    MC_SOURCE_GATE_N_JOBS: int = 8
+    REPAIR_TASK_MIN_MEAN_HR: Optional[float] = None  # None = DS1 mean repair time threshold
     GA_EXTRA_EVAL_HR: float = 24.0     # Extra horizon used in GA evaluation
     RNG_SEED: int = 42
-    N_CREWS_LOCAL: int = 15  
-    N_CREWS_MUTUAL_AID: int = 15 
-    N_CREWS = 30 
     MUTUAL_AID_DELAY_HR: float = 8.0
     N_CORES: int = -1
-    K_NEIGHBORS: int = 5  # Fallback k for KNN graph
 
     # --- GA Parameters
     GA_POP_SIZE: int = 100
-    GA_N_GEN: int = 50
+    GA_N_GEN: int = 100
     GA_CXPB: float = 0.8
     GA_MUTPB: float = 0.2
-    GA_N_RUNS: int = 3
+    STAGE5_NODE_IMPORTANCE_ALPHA: float = 1.0
+    STAGE5_NODE_IMPORTANCE_LINES_SCALE: float = 12.0
+    STAGE5_NODE_IMPORTANCE_ROLE_WEIGHT: float = 0.70
+    STAGE5_NODE_IMPORTANCE_VOLTAGE_WEIGHT: float = 0.20
+    STAGE5_NODE_IMPORTANCE_LINES_WEIGHT: float = 0.10
+    STAGE7_HOTSPOT_TOP_N: int = 10
     GA_SCENARIOS_CONFIG: Dict[str, Dict[str, float]] = field(
         default_factory=lambda: {
             "Balanced":   {"W_POP": 1.0, "W_HOSP": 3.0,  "W_MAKESPAN": 0.5},
@@ -178,22 +176,6 @@ class Config:
     RUN_STAGE_5: bool = True
     RUN_STAGE_6: bool = True
     RUN_STAGE_7: bool = True
-
-# --- Crew Bases (VALIDATED: Consolidated to Transmission Hubs)
-    # Rationale based on LADWP facility functions:
-    # 1. Valley Yard (Sun Valley): Functions as the Transmission Headquarters and heavy equipment depot.
-    #    Essential for Northridge & San Fernando scenarios.
-    # 2. Central Yard (Main St/Boylston): Functions as the Metro strategic hub.
-    #    Essential for Long Beach & downtown scenarios.
-    
-    CREW_BASES: list = field(
-        default_factory=lambda: [
-            # --- Northern Hub: LADWP Transmission HQ (Truesdale/Sun Valley) ---
-            ("Valley Yard (Sun Valley)", 34.2318, -118.3817),
-            # --- Southern Hub: Central Repair Hub (Metro/Main St) ---
-            ("Central Yard", 34.0375, -118.2555),
-        ]
-    )
 
 def setup_logging(log_file: Path) -> logging.Logger:
     """
@@ -268,26 +250,36 @@ def make_out_dirs(cfg: Config) -> Dict[str, Path]:
         dir_path = root / dir_name
         dir_path.mkdir(parents=True, exist_ok=True)
         paths[key] = dir_path
-        logger.info(f"Output directory ensured: {dir_path}")
+        logger.debug("Output directory ensured: %s", dir_path)
 
     # Special subdirectory for GA runs.
     sched_dir = paths["STAGE5_DIR"] / cfg.SCHEDULE_DIR
     sched_dir.mkdir(parents=True, exist_ok=True)
     paths["SCHEDULE_DIR"] = sched_dir
+    logger.info("Stage output directories ensured.")
 
     return paths
 
 
 # --- Repair / Functionality Parameter Tables ---------------------------------
 # Conventions:
+# - INITIAL_FUNCTIONALITY_BY_DS: directly specified residual functionality at t=0
 # - REPAIR_PARAM_NORMAL_HR: (mean_hours, std_hours)
 # - REPAIR_PARAM_LOGNORMAL: (median_hours, beta)  where beta is lognormal dispersion (ln-space)
 
+INITIAL_FUNCTIONALITY_BY_DS = {
+    0: 1.00,
+    1: 0.50,
+    2: 0.09,
+    3: 0.04,
+    4: 0.03,
+}
+
 REPAIR_PARAM_NORMAL_HR = {
     # DS1 (Slight)
-    # Typical actions: travel (2.0 h) + safety inspection (1.5 h) + relay reset (0.5 h)
-    # Reference: substation maintenance logs (relay reset typically < 4 h)
-    1: (4.0, 2.0),
+    # Service-restoration actions: inspection/confirmation, relay reset, and switching.
+    # DS1 is already at 50% initial functionality and remains source-gate passable.
+    1: (1.0, 0.5),
 
     # DS2 (Moderate)
     # Typical actions: travel/inspection (3.5 h) + isolate one phase (2.5 h)
@@ -295,14 +287,14 @@ REPAIR_PARAM_NORMAL_HR = {
     2: (6.0, 3.0),
 
     # DS3 (Extensive)
-    # Typical actions: inspection (2.0 h) + manual isolation (2.0 h) + tie switching (4.0 h)
-    # Validation target: LADWP Northridge notes (~50% restored in ~7.5 h)
-    3: (8.0, 4.0),
+    # Typical actions: inspection, manual isolation, tie switching, and temporary bypass work
+    # Recommended value: 12 +/- 4 h
+    3: (12.0, 4.0),
 
     # DS4 (Complete)
-    # Typical actions: clear site (2.0 h) + install temporary jumpers (8.0 h) + energize (2.0 h)
-    # Reference: MV/HV bypass cabling guidance (installation time per phase < 30 min, excluding setup)
-    4: (12.0, 6.0),
+    # Typical actions: major field reconfiguration, mobile/temporary equipment, and energization
+    # Recommended value: 36 +/- 12 h
+    4: (36.0, 12.0),
 }
 
 REPAIR_PARAM_LOGNORMAL = {
@@ -328,6 +320,51 @@ REPAIR_PARAM_LOGNORMAL = {
 }
 
 
+def get_repair_task_threshold_hr(cfg: Config) -> float:
+    """Return the expected-repair-time threshold for dispatchable crew tasks."""
+    configured = getattr(cfg, "REPAIR_TASK_MIN_MEAN_HR", None)
+    if configured is not None:
+        return float(configured)
+    return float(REPAIR_PARAM_NORMAL_HR[1][0])
+
+
+def select_repair_tasks(mean_repair_times: pd.Series, cfg: Config) -> Tuple[pd.Series, float]:
+    """Select substations whose expected repair workload is DS1-equivalent or larger."""
+    threshold_hr = get_repair_task_threshold_hr(cfg)
+    repair_times = pd.to_numeric(mean_repair_times, errors="coerce").fillna(0.0)
+    repair_times.index = repair_times.index.astype(str).str.strip()
+    return repair_times[repair_times >= threshold_hr], threshold_hr
+
+
+def build_repair_task_threshold_audit(
+    scenario: str,
+    mean_repair_times: pd.Series,
+    ds_probs: pd.DataFrame,
+    cfg: Config,
+) -> pd.DataFrame:
+    """Build a substation-level audit table for the repair-task threshold."""
+    repair_times = pd.to_numeric(mean_repair_times, errors="coerce").fillna(0.0)
+    repair_times.index = repair_times.index.astype(str).str.strip()
+    threshold_hr = get_repair_task_threshold_hr(cfg)
+
+    probs = ds_probs.reindex(index=repair_times.index, columns=range(5), fill_value=0.0)
+    out = pd.DataFrame(
+        {
+            "scenario": scenario,
+            "substation_id": repair_times.index,
+            "mean_repair_time_hr": repair_times.values,
+            "task_threshold_hr": threshold_hr,
+            "is_repair_task": repair_times.values >= threshold_hr,
+            "avg_damage_state": (probs.values * np.arange(5)).sum(axis=1),
+            "p_ds_ge1": probs[[1, 2, 3, 4]].sum(axis=1).values,
+            "p_ds_ge2": probs[[2, 3, 4]].sum(axis=1).values,
+            "p_ds_ge3": probs[[3, 4]].sum(axis=1).values,
+            "p_ds4": probs[4].values,
+        }
+    )
+    return out
+
+
 #  ==========================================================================
 # [PART 2] Stage 0: Data Ingestion & Weight Matrix Construction
 # =============================================================================
@@ -349,21 +386,21 @@ def load_devices(path: str) -> pd.DataFrame:
         if "id" not in devices.columns:
             # 1) Highest priority: HIFLD_ID (matches CEC graph)
             if "HIFLD_ID" in devices.columns:
-                devices["id"] = devices["HIFLD_ID"].astype(str)
+                devices["id"] = devices["HIFLD_ID"]
                 logger.info("Using 'HIFLD_ID' as primary device key.")
 
             # 2) Secondary options
             elif "substation_id" in devices.columns:
                 devices = devices.rename(columns={"substation_id": "id"})
             elif "OBJECTID" in devices.columns:
-                devices["id"] = devices["OBJECTID"].astype(str)
+                devices["id"] = devices["OBJECTID"]
             else:
                 logger.error(
                     "Devices CSV must have an ID column (HIFLD_ID, substation_id, or OBJECTID)."
                 )
                 raise KeyError("No usable ID column in devices CSV")
 
-        devices["id"] = devices["id"].astype(str).str.strip()
+        devices["id"] = devices["id"].map(clean_substation_id)
         return devices
 
     except FileNotFoundError:
@@ -397,19 +434,19 @@ def load_pga(path: str, scenarios: list) -> pd.DataFrame:
     # 1) Auto-detect and standardize the ID column to 'id'.
     if "id" not in pga.columns:
         if "HIFLD_ID" in pga.columns:
-            pga["id"] = pga["HIFLD_ID"].astype(str)
+            pga["id"] = pga["HIFLD_ID"]
             logger.info("load_pga: mapped 'HIFLD_ID' to 'id'")
         elif "substation_id" in pga.columns:
             pga = pga.rename(columns={"substation_id": "id"})
             logger.info("load_pga: mapped 'substation_id' to 'id'")
         elif "OBJECTID" in pga.columns:
-            pga["id"] = pga["OBJECTID"].astype(str)
+            pga["id"] = pga["OBJECTID"]
             logger.info("load_pga: mapped 'OBJECTID' to 'id'")
         else:
             logger.error(f"PGA CSV missing ID column. Available: {list(pga.columns)}")
             raise KeyError("PGA CSV must have an ID column.")
 
-    pga["id"] = pga["id"].astype(str).str.strip()
+    pga["id"] = pga["id"].map(clean_substation_id)
 
     # 2) Detect scenario columns and standardize them to 'pga_<scenario>'.
     for scen in scenarios:
@@ -473,7 +510,7 @@ def load_mapping(path: str) -> pd.DataFrame:
                 raise ValueError("No usable tract id column in mapping file.")
 
         # --- 3) Clean IDs ------------------------------------------------------
-        mapping["substation_id"] = mapping["substation_id"].astype(str).str.strip()
+        mapping["substation_id"] = mapping["substation_id"].map(clean_substation_id)
         mapping["tract_id"] = mapping["tract_id"].astype(str).str.strip()
         mapping = mapping.dropna(subset=["substation_id", "tract_id"])
 
@@ -516,7 +553,7 @@ def build_W_matrix(mapping_df: pd.DataFrame) -> Tuple[np.ndarray, pd.Index, pd.I
     )
 
     W_df.index = W_df.index.astype(str).str.strip()
-    W_df.columns = W_df.columns.astype(str).str.strip()
+    W_df.columns = W_df.columns.map(clean_substation_id)
 
     tract_index = W_df.index
     sub_index = W_df.columns
@@ -567,7 +604,7 @@ def run_stage_0(cfg: Config) -> Dict[str, Any]:
         candidates = ["HIFLD_ID", "substation_id", "OBJECTID"]
         found = next((c for c in candidates if c in devices.columns), None)
         if found:
-            devices["id"] = devices[found].astype(str)
+            devices["id"] = devices[found]
         else:
             logger.error(f"Devices columns: {list(devices.columns)}")
             raise KeyError("Devices DF missing 'id' column before merge.")
@@ -583,8 +620,8 @@ def run_stage_0(cfg: Config) -> Dict[str, Any]:
             raise KeyError("PGA DF missing 'id' column before merge.")
 
     # Ensure IDs are clean strings for merge alignment.
-    devices["id"] = devices["id"].astype(str).str.strip()
-    pga["id"] = pga["id"].astype(str).str.strip()
+    devices["id"] = devices["id"].map(clean_substation_id)
+    pga["id"] = pga["id"].map(clean_substation_id)
 
     # --- 3) Merge devices with PGA --------------------------------------------
     try:
@@ -610,7 +647,7 @@ def run_stage_0(cfg: Config) -> Dict[str, Any]:
     W_mat, tract_index, sub_index = build_W_matrix(mapping)
 
     # --- 5) Align device rows to sub_index ordering ---------------------------
-    sub_index_str = [str(s).strip() for s in sub_index]
+    sub_index_str = [clean_substation_id(s) for s in sub_index]
 
     devices_merged = devices_merged.set_index("id")
     devices_merged = devices_merged.reindex(sub_index_str)
@@ -722,17 +759,9 @@ def damage_to_functionality_and_repair(
     """
     Map sampled damage states to initial functionality and repair times.
     """
-    # 1) Init functionality @ t=0
-    DS_INIT_FUNC_MAP = {0: 1.0}
-
-    for ds, (mean_hr, std_hr) in REPAIR_PARAM_NORMAL_HR.items():
-        if std_hr > 1e-9:
-            DS_INIT_FUNC_MAP[ds] = norm.cdf(0.0, loc=mean_hr, scale=std_hr)
-        else:
-            DS_INIT_FUNC_MAP[ds] = 1.0 if mean_hr <= 0 else 0.0
-
+    # 1) Init functionality @ t=0: use the manually specified DS residuals.
     func0_samples = np.full(ds_samples.shape, np.nan, dtype=float)
-    for ds, val in DS_INIT_FUNC_MAP.items():
+    for ds, val in INITIAL_FUNCTIONALITY_BY_DS.items():
         func0_samples[ds_samples == ds] = float(val)
 
     # 2) Repair time samples (hr)
@@ -783,7 +812,7 @@ def ensure_substation_id_col(df: pd.DataFrame) -> pd.DataFrame:
     """
     for col in SUBSTATION_ID_SOURCE_COLS:
         if col in df.columns:
-            df[SUBSTATION_ID_CANON_COL] = df[col].astype(str).str.strip()
+            df[SUBSTATION_ID_CANON_COL] = df[col].map(clean_substation_id)
             return df
 
     raise KeyError(
@@ -798,6 +827,261 @@ def get_substation_id_array(df: pd.DataFrame) -> np.ndarray:
     return df[SUBSTATION_ID_CANON_COL].values
 
 
+def clean_substation_id(value: Any) -> str:
+    """Normalize ID values imported from CSVs without changing substantive digits."""
+    s = str(value).strip()
+    if not s or s.lower() in {"nan", "none", "<na>"}:
+        return ""
+    try:
+        f = float(s)
+        if np.isfinite(f) and f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+    if s.endswith(".0"):
+        return s[:-2]
+    return s
+
+
+def load_source_role_table(cfg: Config, sub_index: Optional[pd.Index] = None) -> pd.DataFrame:
+    """
+    Read the project source-node table once and expose common role fields.
+
+    Returns columns:
+        - substation_id
+        - role_key
+        - role_text
+        - is_source
+        - source_role_score
+    """
+    logger = logging.getLogger()
+    source_path = Path(getattr(cfg, "SOURCE_NODES_CSV", ""))
+    empty = pd.DataFrame(
+        columns=["substation_id", "role_key", "role_text", "is_source", "source_role_score"]
+    )
+
+    if not source_path.exists():
+        logger.warning("Source role table not found: %s", source_path)
+        return empty
+
+    try:
+        source_df = pd.read_csv(source_path)
+    except Exception as e:
+        logger.warning("Failed to read source role table %s: %s", source_path, e)
+        return empty
+
+    id_col = next(
+        (
+            c
+            for c in ["substation_id", "HIFLD_ID", "ID", "id", "node_id"]
+            if c in source_df.columns
+        ),
+        None,
+    )
+    if id_col is None:
+        logger.warning("Source role table missing usable ID column: %s", source_path)
+        return empty
+
+    role_candidates = ["level", "role", "source_level", "source_type", "active_set"]
+    role_cols = [c for c in role_candidates if c in source_df.columns]
+
+    role_text = pd.Series("", index=source_df.index, dtype="object")
+    for col in role_cols:
+        role_text = role_text + " " + source_df[col].astype(str).str.lower()
+
+    if role_cols:
+        role_key_col = next((c for c in role_candidates if c in source_df.columns), role_cols[0])
+        role_key = source_df[role_key_col].astype(str).str.strip().str.lower()
+    else:
+        role_key = pd.Series("", index=source_df.index, dtype="object")
+
+    is_source = (
+        role_text.str.contains("core", na=False)
+        | role_text.str.contains("import_interface_proxy", na=False)
+        | role_text.str.contains("in_basin_generation_proxy", na=False)
+    )
+    is_source &= ~role_text.str.contains("transit_hub_not_source|\\btransit\\b", na=False)
+
+    role_map = {
+        "core": 1.0,
+        "transit": 0.60,
+        "import_interface_proxy": 1.0,
+        "in_basin_generation_proxy": 1.0,
+        "transit_hub_not_source": 0.60,
+    }
+    role_score = role_key.map(role_map)
+    role_score = role_score.where(~role_score.isna(), np.where(is_source, 1.0, np.nan))
+    role_score = pd.Series(role_score, index=source_df.index).fillna(0.0).astype(float)
+
+    out = pd.DataFrame(
+        {
+            "substation_id": source_df[id_col].map(clean_substation_id),
+            "role_key": role_key,
+            "role_text": role_text.str.strip(),
+            "is_source": is_source.astype(bool),
+            "source_role_score": role_score,
+        }
+    )
+    out = out[out["substation_id"].astype(bool)].drop_duplicates("substation_id").copy()
+
+    if sub_index is not None:
+        valid_ids = {clean_substation_id(x) for x in sub_index}
+        missing_ids = sorted(set(out["substation_id"]) - valid_ids)
+        if missing_ids:
+            logger.info("Source role table: %d IDs absent from active substation universe.", len(missing_ids))
+        out = out[out["substation_id"].isin(valid_ids)].copy()
+
+    return out
+
+
+def load_source_gate_nodes(cfg: Config, sub_index: Optional[pd.Index] = None) -> set[str]:
+    """
+    Load source/generation/import nodes used to gate delivered functionality.
+
+    The project has used two source-table schemas: the city-scale file has
+    ``node_id`` plus ``active_set=core``; the expanded file has ``ID`` plus
+    ``level=Core``. This helper accepts both and treats only core/import/
+    generation rows as energizing sources.
+    """
+    logger = logging.getLogger()
+    role_df = load_source_role_table(cfg, sub_index=sub_index)
+    source_ids = set(role_df.loc[role_df["is_source"], "substation_id"])
+    logger.debug("Source gate: loaded %d active source nodes.", len(source_ids))
+    return source_ids
+
+
+def apply_source_gate_to_substation_series(
+    sub_series_df: pd.DataFrame,
+    G: nx.Graph,
+    cfg: Config,
+    source_ids: Optional[set[str]] = None,
+    label: str = "",
+) -> pd.DataFrame:
+    """
+    Zero substation functionality unless it belongs to an energized source island.
+
+    At each timestep, nodes with functionality >= cfg.FUNCTIONAL_THRESHOLD form
+    the functional transmission subgraph. Only components containing at least
+    one active source node are allowed to deliver functionality downstream.
+    """
+    logger = logging.getLogger()
+    if not getattr(cfg, "SOURCE_GATE_ENABLED", True):
+        return sub_series_df
+    if sub_series_df.empty or G is None or G.number_of_nodes() == 0:
+        return sub_series_df
+
+    columns_norm = [clean_substation_id(c) for c in sub_series_df.columns]
+    col_index = pd.Index(columns_norm)
+
+    if source_ids is None:
+        source_ids = load_source_gate_nodes(cfg, pd.Index(columns_norm))
+    source_ids = {sid for sid in (clean_substation_id(s) for s in source_ids) if sid}
+
+    G_norm = nx.relabel_nodes(G, lambda n: clean_substation_id(n), copy=True)
+    graph_nodes = {n for n in G_norm.nodes() if n}
+    valid_sources = source_ids & graph_nodes & set(columns_norm)
+    if not valid_sources:
+        logger.warning(
+            "Source gate%s: no valid source nodes overlap the recovery series and graph; "
+            "leaving functionality ungated.",
+            f" ({label})" if label else "",
+        )
+        return sub_series_df
+
+    threshold = float(getattr(cfg, "FUNCTIONAL_THRESHOLD", 0.5))
+    values = sub_series_df.to_numpy(dtype=float, copy=True)
+    raw_values = values.copy()
+    valid_col_mask = np.array([c in graph_nodes for c in columns_norm], dtype=bool)
+    gate_cache: Dict[Tuple[str, ...], Tuple[np.ndarray, int, int]] = {}
+
+    first_active_sources = 0
+    first_kept_nodes = 0
+    last_active_sources = 0
+    last_kept_nodes = 0
+
+    for row_idx in range(values.shape[0]):
+        functional_mask = (values[row_idx, :] >= threshold) & valid_col_mask
+        functional_nodes = tuple(col_index[functional_mask])
+
+        cached = gate_cache.get(functional_nodes)
+        if cached is None:
+            functional_set = set(functional_nodes)
+            active_sources = valid_sources & functional_set
+            keep_nodes: set[str] = set()
+
+            if active_sources:
+                G_t = G_norm.subgraph(functional_set)
+                for component in nx.connected_components(G_t):
+                    if active_sources.intersection(component):
+                        keep_nodes.update(component)
+
+            keep_mask = np.array([c in keep_nodes for c in columns_norm], dtype=bool)
+            cached = (keep_mask, len(active_sources), len(keep_nodes))
+            gate_cache[functional_nodes] = cached
+
+        keep_mask, active_source_count, kept_node_count = cached
+        values[row_idx, ~keep_mask] = 0.0
+
+        if row_idx == 0:
+            first_active_sources = active_source_count
+            first_kept_nodes = kept_node_count
+        last_active_sources = active_source_count
+        last_kept_nodes = kept_node_count
+
+    label_text = f" ({label})" if label else ""
+    log_source_gate = logger.info if str(label).startswith("Stage3") else logger.debug
+    log_source_gate(
+        "Source gate%s: sources=%d, t0_active_sources=%d, t0_source_connected_nodes=%d, "
+        "final_active_sources=%d, final_source_connected_nodes=%d, mean_t0 %.3f->%.3f",
+        label_text,
+        len(valid_sources),
+        first_active_sources,
+        first_kept_nodes,
+        last_active_sources,
+        last_kept_nodes,
+        float(np.nanmean(raw_values[0, :])) if raw_values.size else 0.0,
+        float(np.nanmean(values[0, :])) if values.size else 0.0,
+    )
+
+    return pd.DataFrame(values, index=sub_series_df.index, columns=sub_series_df.columns)
+
+
+def apply_source_gate_to_initial_functionality_samples(
+    func0_samples: np.ndarray,
+    sub_ids: np.ndarray,
+    G: nx.Graph,
+    cfg: Config,
+    source_ids: Optional[set[str]] = None,
+) -> np.ndarray:
+    """
+    Apply the same active-source island gate used by recovery stages to Stage 1
+    Monte Carlo initial functionality samples.
+
+    Input shape is (n_substations, n_samples). The source-gate helper works on
+    row-wise time/sample frames, so we transpose to samples x substations and
+    transpose back after gating.
+    """
+    if not getattr(cfg, "SOURCE_GATE_ENABLED", True):
+        return func0_samples
+    if G is None or G.number_of_nodes() == 0:
+        return func0_samples
+    if func0_samples.size == 0:
+        return func0_samples
+
+    sample_df = pd.DataFrame(
+        func0_samples.T,
+        columns=[clean_substation_id(s) for s in sub_ids],
+    )
+    gated_df = apply_source_gate_to_substation_series(
+        sample_df,
+        G,
+        cfg,
+        source_ids=source_ids,
+        label="Stage1",
+    )
+    return gated_df.to_numpy(dtype=float).T
+
+
 def _process_mc_chunk(
     scenario,
     pga_series,
@@ -807,6 +1091,8 @@ def _process_mc_chunk(
     n_chunk,
     rng_seed,
     cfg,
+    source_gate_graph=None,
+    source_ids=None,
 ):
     """Helper function for parallel MC processing with voltage-dependent redundancy."""
     rng = np.random.default_rng(rng_seed)
@@ -820,6 +1106,14 @@ def _process_mc_chunk(
         ds_samples,
         rng,
         cfg,
+    )
+    sub_ids = get_substation_id_array(devices_df)
+    func0_samples = apply_source_gate_to_initial_functionality_samples(
+        func0_samples,
+        sub_ids,
+        source_gate_graph,
+        cfg,
+        source_ids=source_ids,
     )
 
     # --- Device-level aggregation -------------------------------------------
@@ -841,7 +1135,6 @@ def _process_mc_chunk(
         .repeat(n_devices, axis=0)
     )
 
-    sub_ids = get_substation_id_array(devices_df)
     sub_ids_rep = np.repeat(sub_ids.reshape(-1, 1), n_chunk, axis=1)
 
     device_records_df = pd.DataFrame(
@@ -883,9 +1176,27 @@ def run_stage_1(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
 
     # Derive sub_index from the canonical substation_id.
     sub_index = pd.Index(
-        devices_merged["substation_id"].astype(str),
+        devices_merged["substation_id"].map(clean_substation_id),
         name="substation_id",
     )
+
+    source_gate_graph = nx.Graph()
+    source_ids: set[str] = set()
+    if getattr(cfg, "SOURCE_GATE_ENABLED", True):
+        source_gate_graph = build_base_graph(cfg, devices_merged, sub_index)
+        source_ids = load_source_gate_nodes(cfg, sub_index)
+        if source_gate_graph.number_of_nodes() > 0 and source_ids:
+            logger.info(
+                "Stage 1 source gate enabled for initial supply: %d active source nodes, graph=%d nodes/%d edges.",
+                len(source_ids),
+                source_gate_graph.number_of_nodes(),
+                source_gate_graph.number_of_edges(),
+            )
+        else:
+            logger.warning(
+                "Stage 1 source gate requested but graph/source nodes are unavailable; "
+                "initial supply will remain fragility-only."
+            )
 
     # Determine parallelism
     n_cores = (os.cpu_count() or 1) if cfg.N_CORES == -1 else max(1, cfg.N_CORES)
@@ -939,6 +1250,8 @@ def run_stage_1(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
                 n_chunk,
                 seed,
                 cfg,
+                source_gate_graph,
+                source_ids,
             )
             for n_chunk, seed in zip(chunks, chunk_seeds)
         )
@@ -963,7 +1276,7 @@ def run_stage_1(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
 
         out_path = out_dirs["STAGE1_DIR"] / f"MC_Device_Damage_Records_{scenario}.csv.gz"
         device_records_df.to_csv(out_path, index=False, compression="gzip")
-        logger.info(f"Saved device records: {out_path}")
+        logger.debug("Saved device records: %s", out_path)
 
         # Free memory
         del device_records_df, device_records_list
@@ -997,7 +1310,7 @@ def run_stage_1(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
 
         out_path = out_dirs["STAGE1_DIR"] / f"MC_Device_InitFuncMean_{scenario}.csv"
         df_init.to_csv(out_path, index=False)
-        logger.info(f"Saved init func mean: {out_path}")
+        logger.debug("Saved init func mean: %s", out_path)
 
         all_mean_func0[scenario] = device_mean_func0
 
@@ -1016,7 +1329,7 @@ def run_stage_1(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
 
         # --- 4) Store full repair time samples ----------------------
         all_mc_repair_times[scenario] = np.concatenate(repair_time_chunks, axis=1)
-        logger.info(f"Aggregated results for {scenario}.")
+        logger.info("Aggregated Stage 1 results for %s.", scenario)
 
     logger.info("--- STAGE 1 Complete ---")
     return {"all_mc_repair_times": all_mc_repair_times, "all_mean_func0": all_mean_func0}
@@ -1057,8 +1370,8 @@ def build_base_graph(cfg: Config, devices_df: pd.DataFrame, sub_index: pd.Index)
             else:
                 edf["length_km"] = 1.0
 
-        edf["u"] = edf["u"].astype(str).str.strip()
-        edf["v"] = edf["v"].astype(str).str.strip()
+        edf["u"] = edf["u"].map(clean_substation_id)
+        edf["v"] = edf["v"].map(clean_substation_id)
 
         # 3) Build full multigraph
         G_full = nx.from_pandas_edgelist(
@@ -1070,7 +1383,7 @@ def build_base_graph(cfg: Config, devices_df: pd.DataFrame, sub_index: pd.Index)
         )
 
         # 4) Filter to device IDs (intersection: in edge list AND in device inventory)
-        sub_index_set = {str(s).strip() for s in sub_index}
+        sub_index_set = {clean_substation_id(s) for s in sub_index}
         valid_nodes = [n for n in G_full.nodes() if n in sub_index_set]
         G = G_full.subgraph(valid_nodes).copy()
 
@@ -1090,7 +1403,7 @@ def build_base_graph(cfg: Config, devices_df: pd.DataFrame, sub_index: pd.Index)
 
                 if id_col and lat_col and lon_col:
                     # Sanitize IDs in node table, then index by ID
-                    ndf[id_col] = ndf[id_col].astype(str).str.strip()
+                    ndf[id_col] = ndf[id_col].map(clean_substation_id)
                     ndf = ndf.set_index(id_col)
 
                     pos_dict = {}
@@ -1246,7 +1559,7 @@ def compute_population_impact(G: nx.Graph, mapping_df: Optional[pd.DataFrame]) -
         - Treat the LCC as the "main energized island"; nodes outside it are considered outaged.
     """
     logger = logging.getLogger()
-    nodes_all = [str(n) for n in G.nodes()]
+    nodes_all = [clean_substation_id(n) for n in G.nodes()]
 
     if G.number_of_nodes() == 0:
         return pd.Series(dtype=float, name="impact_population")
@@ -1270,7 +1583,7 @@ def compute_population_impact(G: nx.Graph, mapping_df: Optional[pd.DataFrame]) -
         return pd.Series(0.0, index=nodes_all, name="impact_population")
 
     # Sanitize IDs and numeric fields
-    m["substation_id"] = m["substation_id"].astype(str).str.strip()
+    m["substation_id"] = m["substation_id"].map(clean_substation_id)
     m["population"] = pd.to_numeric(m["population"], errors="coerce").fillna(0.0)
     m["weight"] = pd.to_numeric(m["weight"], errors="coerce").fillna(0.0)
 
@@ -1369,6 +1682,242 @@ def compute_percolation_curves(G: nx.Graph, centrality: pd.Series, out_path: Pat
     logger.info(f"Percolation curve saved to {out_path}")
 
 
+def export_graph_sanity_diagnostics(
+    G: nx.Graph,
+    out_dir: Path,
+    cfg: Optional[Config] = None,
+    devices_df: Optional[pd.DataFrame] = None,
+) -> None:
+    """Export compact topology sanity checks for the prebuilt substation graph."""
+    logger = logging.getLogger()
+    out_dir = Path(out_dir)
+
+    degree = pd.Series(dict(G.degree()), name="degree").astype(float)
+    degree_summary = pd.DataFrame(
+        {
+            "metric": ["count", "min", "p25", "median", "p75", "p90", "p95", "max", "mean"],
+            "degree": [
+                float(degree.count()),
+                float(degree.min()) if len(degree) else np.nan,
+                float(degree.quantile(0.25)) if len(degree) else np.nan,
+                float(degree.quantile(0.50)) if len(degree) else np.nan,
+                float(degree.quantile(0.75)) if len(degree) else np.nan,
+                float(degree.quantile(0.90)) if len(degree) else np.nan,
+                float(degree.quantile(0.95)) if len(degree) else np.nan,
+                float(degree.max()) if len(degree) else np.nan,
+                float(degree.mean()) if len(degree) else np.nan,
+            ],
+        }
+    )
+    degree_summary.to_csv(out_dir / "graph_degree_summary.csv", index=False)
+
+    degree_dist = (
+        degree.astype(int)
+        .value_counts()
+        .sort_index()
+        .rename_axis("degree")
+        .reset_index(name="n_nodes")
+    )
+    degree_dist["share_nodes"] = degree_dist["n_nodes"] / max(G.number_of_nodes(), 1)
+    degree_dist.to_csv(out_dir / "graph_degree_distribution.csv", index=False)
+
+    node_degree = degree.sort_values(ascending=False).rename_axis("substation_id").reset_index()
+    node_degree.to_csv(out_dir / "graph_node_degree_rank.csv", index=False)
+
+    edge_rows = []
+    for u, v, attrs in G.edges(data=True):
+        length_km = pd.to_numeric(attrs.get("length_km", np.nan), errors="coerce")
+        u_data = G.nodes[u]
+        v_data = G.nodes[v]
+        u_lat = pd.to_numeric(u_data.get("lat", np.nan), errors="coerce")
+        u_lon = pd.to_numeric(u_data.get("lon", np.nan), errors="coerce")
+        v_lat = pd.to_numeric(v_data.get("lat", np.nan), errors="coerce")
+        v_lon = pd.to_numeric(v_data.get("lon", np.nan), errors="coerce")
+
+        straight_km = np.nan
+        if np.isfinite(u_lat) and np.isfinite(u_lon) and np.isfinite(v_lat) and np.isfinite(v_lon):
+            try:
+                straight_km = geodesic((u_lat, u_lon), (v_lat, v_lon)).km
+            except Exception:
+                straight_km = np.nan
+
+        edge_rows.append(
+            {
+                "u": u,
+                "v": v,
+                "length_km": float(length_km) if np.isfinite(length_km) else np.nan,
+                "straight_line_km": float(straight_km) if np.isfinite(straight_km) else np.nan,
+                "length_to_straight_ratio": (
+                    float(length_km) / float(straight_km)
+                    if np.isfinite(length_km) and np.isfinite(straight_km) and straight_km > 0
+                    else np.nan
+                ),
+                "u_degree": int(G.degree(u)),
+                "v_degree": int(G.degree(v)),
+            }
+        )
+
+    edge_df = pd.DataFrame(edge_rows)
+    if edge_df.empty:
+        logger.warning("Graph sanity diagnostics: no edges available for length checks.")
+        return
+
+    lengths = pd.to_numeric(edge_df["length_km"], errors="coerce").dropna()
+    length_summary = pd.DataFrame(
+        {
+            "metric": ["count", "min", "p25", "median", "p75", "p90", "p95", "p99", "max", "mean"],
+            "length_km": [
+                float(lengths.count()),
+                float(lengths.min()) if len(lengths) else np.nan,
+                float(lengths.quantile(0.25)) if len(lengths) else np.nan,
+                float(lengths.quantile(0.50)) if len(lengths) else np.nan,
+                float(lengths.quantile(0.75)) if len(lengths) else np.nan,
+                float(lengths.quantile(0.90)) if len(lengths) else np.nan,
+                float(lengths.quantile(0.95)) if len(lengths) else np.nan,
+                float(lengths.quantile(0.99)) if len(lengths) else np.nan,
+                float(lengths.max()) if len(lengths) else np.nan,
+                float(lengths.mean()) if len(lengths) else np.nan,
+            ],
+        }
+    )
+    length_summary.to_csv(out_dir / "graph_edge_length_summary.csv", index=False)
+
+    bins = [0, 1, 2, 5, 10, 20, 50, 100, 200, np.inf]
+    edge_df["length_bin_km"] = pd.cut(
+        edge_df["length_km"],
+        bins=bins,
+        right=False,
+        labels=["0-1", "1-2", "2-5", "5-10", "10-20", "20-50", "50-100", "100-200", "200+"],
+    )
+    length_dist = (
+        edge_df.groupby("length_bin_km", observed=False)
+        .size()
+        .reset_index(name="n_edges")
+    )
+    length_dist["share_edges"] = length_dist["n_edges"] / max(G.number_of_edges(), 1)
+    length_dist.to_csv(out_dir / "graph_edge_length_distribution.csv", index=False)
+
+    top_links = edge_df.sort_values("length_km", ascending=False).head(25)
+    top_links.to_csv(out_dir / "graph_top_links_sanity.csv", index=False)
+
+    node_ids = [clean_substation_id(n) for n in G.nodes()]
+    node_attrs = node_degree.copy()
+    node_attrs["substation_id"] = node_attrs["substation_id"].map(clean_substation_id)
+
+    if devices_df is not None and not devices_df.empty:
+        try:
+            dev = ensure_substation_id_col(devices_df.copy())
+            keep_cols = [
+                c
+                for c in ["substation_id", "NAME", "CITY", "Owner", "MAX_VOLT", "LINES"]
+                if c in dev.columns
+            ]
+            dev = dev[keep_cols].drop_duplicates("substation_id")
+            node_attrs = node_attrs.merge(dev, on="substation_id", how="left")
+        except Exception as e:
+            logger.warning("Graph hub sanity: failed to attach device attributes: %s", e)
+
+    if cfg is not None:
+        roles = load_source_role_table(cfg, sub_index=pd.Index(node_ids))
+        if not roles.empty:
+            roles = roles[["substation_id", "role_key", "role_text", "is_source", "source_role_score"]]
+            node_attrs = node_attrs.merge(roles, on="substation_id", how="left")
+
+    for col in ["MAX_VOLT", "LINES"]:
+        if col not in node_attrs.columns:
+            node_attrs[col] = np.nan
+    if "role_text" not in node_attrs.columns:
+        node_attrs["role_text"] = ""
+
+    node_attrs["MAX_VOLT_N"] = pd.to_numeric(node_attrs["MAX_VOLT"], errors="coerce")
+    node_attrs["LINES_N"] = pd.to_numeric(node_attrs["LINES"], errors="coerce")
+    role_text = node_attrs["role_text"].fillna("").astype(str).str.lower()
+    node_attrs["is_role_hub"] = role_text.str.contains("core|transit|import_interface|generation", na=False)
+    node_attrs["is_voltage_hub"] = node_attrs["MAX_VOLT_N"] >= 138
+    node_attrs["is_line_hub"] = node_attrs["LINES_N"] >= 6
+    node_attrs["hub_evidence_count"] = node_attrs[["is_role_hub", "is_voltage_hub", "is_line_hub"]].sum(axis=1)
+    node_attrs["sanity_flag"] = "ok"
+    suspicious_mask = (node_attrs["degree"] >= 20) & (node_attrs["hub_evidence_count"] == 0)
+    mixed_mask = (node_attrs["degree"] >= 20) & (node_attrs["hub_evidence_count"] == 1)
+    node_attrs.loc[suspicious_mask, "sanity_flag"] = "suspicious_high_degree_low_hub_evidence"
+    node_attrs.loc[mixed_mask, "sanity_flag"] = "mixed_evidence"
+    node_attrs.to_csv(out_dir / "graph_hub_sanity_rank.csv", index=False)
+
+    sensitivity_thresholds = [None, 20.0, 25.0, 30.0, 35.0, 40.0, 50.0]
+    sensitivity_rows = []
+    sensitivity_top_rows = []
+    for threshold in sensitivity_thresholds:
+        label = "none" if threshold is None else f"le_{threshold:g}km"
+        H = nx.Graph()
+        H.add_nodes_from(G.nodes())
+        for u, v, attrs in G.edges(data=True):
+            length_val = pd.to_numeric(attrs.get("length_km", np.nan), errors="coerce")
+            if threshold is None or (np.isfinite(length_val) and float(length_val) <= threshold):
+                H.add_edge(u, v)
+
+        sens_degree = (
+            pd.Series(dict(H.degree()), name="degree")
+            .rename_axis("substation_id")
+            .reset_index()
+        )
+        sens_degree["substation_id"] = sens_degree["substation_id"].map(clean_substation_id)
+        sens_attrs = sens_degree.merge(
+            node_attrs.drop(columns=["degree"], errors="ignore"),
+            on="substation_id",
+            how="left",
+        ).sort_values("degree", ascending=False)
+
+        sens_attrs["threshold"] = label
+        sens_attrs["sanity_flag"] = "ok"
+        sens_suspicious = (sens_attrs["degree"] >= 20) & (sens_attrs["hub_evidence_count"] == 0)
+        sens_mixed = (sens_attrs["degree"] >= 20) & (sens_attrs["hub_evidence_count"] == 1)
+        sens_attrs.loc[sens_suspicious, "sanity_flag"] = "suspicious_high_degree_low_hub_evidence"
+        sens_attrs.loc[sens_mixed, "sanity_flag"] = "mixed_evidence"
+        high = sens_attrs[sens_attrs["degree"] >= 20]
+        components = sorted((len(c) for c in nx.connected_components(H)), reverse=True)
+        top10 = sens_attrs.head(10)
+
+        sensitivity_rows.append(
+            {
+                "threshold": label,
+                "max_dist_km": "" if threshold is None else threshold,
+                "n_nodes": H.number_of_nodes(),
+                "n_edges": H.number_of_edges(),
+                "n_components": nx.number_connected_components(H) if H.number_of_nodes() else 0,
+                "largest_component_nodes": components[0] if components else 0,
+                "second_component_nodes": components[1] if len(components) > 1 else 0,
+                "isolates": nx.number_of_isolates(H),
+                "mean_degree": float(np.mean([d for _, d in H.degree()])) if H.number_of_nodes() else 0.0,
+                "median_degree": float(sens_attrs["degree"].median()) if len(sens_attrs) else np.nan,
+                "p90_degree": float(sens_attrs["degree"].quantile(0.90)) if len(sens_attrs) else np.nan,
+                "max_degree": int(sens_attrs["degree"].max()) if len(sens_attrs) else 0,
+                "nodes_degree_ge20": int(len(high)),
+                "suspicious_degree_ge20": int((high["hub_evidence_count"] == 0).sum()),
+                "mixed_degree_ge20": int((high["hub_evidence_count"] == 1).sum()),
+                "top10_hub_evidence_ge2": int((top10["hub_evidence_count"] >= 2).sum()),
+                "top10_names": "; ".join(top10.get("NAME", top10["substation_id"]).fillna("").astype(str)),
+            }
+        )
+        sensitivity_top_rows.append(sens_attrs.head(30))
+
+    pd.DataFrame(sensitivity_rows).to_csv(
+        out_dir / "graph_direct_link_length_sensitivity.csv",
+        index=False,
+    )
+    pd.concat(sensitivity_top_rows, ignore_index=True).to_csv(
+        out_dir / "graph_direct_link_length_sensitivity_top30.csv",
+        index=False,
+    )
+
+    logger.info(
+        "Graph sanity diagnostics saved: max degree=%s, median edge=%.2f km, p95 edge=%.2f km, max edge=%.2f km.",
+        int(degree.max()) if len(degree) else 0,
+        float(lengths.quantile(0.50)) if len(lengths) else np.nan,
+        float(lengths.quantile(0.95)) if len(lengths) else np.nan,
+        float(lengths.max()) if len(lengths) else np.nan,
+    )
+
+
 def run_stage_2(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
     """Orchestrate Stage 2.5: graph criticality metrics and percolation curves."""
     if not cfg.RUN_STAGE_2:
@@ -1384,7 +1933,7 @@ def run_stage_2(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
     devices_merged = ensure_substation_id_col(devices_merged)
 
     sub_index = pd.Index(
-        devices_merged["substation_id"].astype(str),
+        devices_merged["substation_id"].map(clean_substation_id),
         name="substation_id",
     )
 
@@ -1436,6 +1985,8 @@ def run_stage_2(cfg: Config, stage_0_data: Dict, out_dirs: Dict) -> Dict:
     out_path = out_dir / "impact_centrality_substations.csv"
     centrality_df.to_csv(out_path, index_label="substation_id")
     logger.info(f"Centrality metrics saved to {out_path}")
+
+    export_graph_sanity_diagnostics(G, out_dir, cfg=cfg, devices_df=devices_merged)
 
     # -------------------------------------------------------------------------
     # Percolation curves
@@ -1529,16 +2080,23 @@ def simulate_recovery(
             if method == 'lognormal':
                 # Expert Logic: Lognorm(Median, Beta)
                 # s=Beta, scale=Median
-                cdf_vals = lognorm.cdf(t_eff_matrix, s=p2, scale=p1)
+                raw_cdf_vals = lognorm.cdf(t_eff_matrix, s=p2, scale=p1)
+                cdf_at_zero = float(lognorm.cdf(0.0, s=p2, scale=p1))
                 
             elif method == 'normal':
                 # Old Logic: Normal(Mean/Factor, Std)
                 # Apply bypass factor to Mean only
                 adjusted_mu = p1
-                cdf_vals = norm.cdf(t_eff_matrix, loc=adjusted_mu, scale=p2)
+                raw_cdf_vals = norm.cdf(t_eff_matrix, loc=adjusted_mu, scale=p2)
+                cdf_at_zero = float(norm.cdf(0.0, loc=adjusted_mu, scale=p2))
             
             else:
                 raise ValueError(f"Unknown method: {method}")
+
+            init_func = float(INITIAL_FUNCTIONALITY_BY_DS.get(ds, 0.0))
+            denom = max(1.0 - cdf_at_zero, 1e-12)
+            progress_vals = np.clip((raw_cdf_vals - cdf_at_zero) / denom, 0.0, 1.0)
+            cdf_vals = init_func + (1.0 - init_func) * progress_vals
             
             # Add Weighted Contribution: P(DS) * CDF(t)
             # Broadcasting: (1, N_subs) * (N_time, N_subs)
@@ -1546,6 +2104,234 @@ def simulate_recovery(
 
     # Clip result to [0, 1] to handle floating point noise
     return pd.DataFrame(np.clip(F_t_mat, 0.0, 1.0), index=t_grid, columns=sub_index)
+
+
+def _damage_records_to_state_matrix(
+    df_recs: pd.DataFrame,
+    sub_index: pd.Index,
+) -> np.ndarray:
+    """
+    Convert long-form Stage 1 MC damage records into a substation x MC matrix.
+
+    The Stage 1 writer keeps ``mc_id`` aligned across substations, so each
+    matrix column is one Monte Carlo realization over the full network.
+    """
+    if not {"substation_id", "mc_id", "damage_state"}.issubset(df_recs.columns):
+        raise ValueError("Damage records must contain substation_id, mc_id, and damage_state columns.")
+
+    recs = df_recs[["substation_id", "mc_id", "damage_state"]].copy()
+    recs["substation_id"] = recs["substation_id"].map(clean_substation_id)
+    recs["mc_id"] = pd.to_numeric(recs["mc_id"], errors="coerce").astype("Int64")
+    recs = recs.dropna(subset=["mc_id"])
+    recs["mc_id"] = recs["mc_id"].astype(int)
+
+    ds_matrix_df = recs.pivot_table(
+        index="substation_id",
+        columns="mc_id",
+        values="damage_state",
+        aggfunc="first",
+    )
+    ds_matrix_df = ds_matrix_df.reindex(
+        index=[clean_substation_id(s) for s in sub_index],
+        columns=sorted(ds_matrix_df.columns),
+    )
+    if ds_matrix_df.isna().any().any():
+        missing = int(ds_matrix_df.isna().sum().sum())
+        raise ValueError(f"Damage-state matrix has {missing} missing substation/MC entries.")
+
+    return ds_matrix_df.to_numpy(dtype=np.int8)
+
+
+def _precompute_ds_recovery_curves(
+    t_grid: np.ndarray,
+    sub_index: pd.Index,
+    start_times: Optional[np.ndarray] = None,
+    method: str = "normal",
+) -> np.ndarray:
+    """Precompute one recovery curve per damage state and substation."""
+    n_time = len(t_grid)
+    n_subs = len(sub_index)
+
+    if start_times is None:
+        start_times = np.zeros(n_subs)
+    start_times = np.asarray(start_times, dtype=float)
+    if start_times.shape[0] != n_subs:
+        raise ValueError(f"start_times length {start_times.shape[0]} != n_subs {n_subs}")
+
+    t_eff_matrix = t_grid[:, np.newaxis] - start_times[np.newaxis, :]
+    t_eff_matrix = np.maximum(t_eff_matrix, 1e-9)
+
+    curves = np.zeros((5, n_time, n_subs), dtype=np.float32)
+    curves[0, :, :] = 1.0
+
+    ds_params = REPAIR_PARAM_LOGNORMAL if method == "lognormal" else REPAIR_PARAM_NORMAL_HR
+    for ds in range(1, 5):
+        params = ds_params.get(ds)
+        if params is None:
+            continue
+        p1, p2 = params
+        if method == "lognormal":
+            raw_cdf_vals = lognorm.cdf(t_eff_matrix, s=p2, scale=p1)
+            cdf_at_zero = float(lognorm.cdf(0.0, s=p2, scale=p1))
+        elif method == "normal":
+            raw_cdf_vals = norm.cdf(t_eff_matrix, loc=p1, scale=p2)
+            cdf_at_zero = float(norm.cdf(0.0, loc=p1, scale=p2))
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+        init_func = float(INITIAL_FUNCTIONALITY_BY_DS.get(ds, 0.0))
+        denom = max(1.0 - cdf_at_zero, 1e-12)
+        progress_vals = np.clip((raw_cdf_vals - cdf_at_zero) / denom, 0.0, 1.0)
+        curves[ds, :, :] = (init_func + (1.0 - init_func) * progress_vals).astype(np.float32)
+
+    return np.clip(curves, 0.0, 1.0)
+
+
+def simulate_recovery_mc_source_gated(
+    t_grid: np.ndarray,
+    sub_index: pd.Index,
+    damage_state_samples: np.ndarray,
+    G: nx.Graph,
+    cfg: Config,
+    source_ids: Optional[set[str]] = None,
+    start_times: Optional[np.ndarray] = None,
+    method: str = "normal",
+    label: str = "",
+) -> pd.DataFrame:
+    """
+    Estimate mean recovery as E[gate(F_run(t))] from MC damage realizations.
+
+    This is stricter than applying the source gate to the expected recovery
+    curve, because the energized island test is evaluated separately for each
+    Monte Carlo realization and each recovery time step before averaging.
+    """
+    logger = logging.getLogger()
+    sub_index = pd.Index([clean_substation_id(s) for s in sub_index], name="substation_id")
+    ds_arr = np.asarray(damage_state_samples, dtype=np.int8)
+    n_subs = len(sub_index)
+    if ds_arr.ndim != 2:
+        raise ValueError("damage_state_samples must be a 2D substation x MC matrix.")
+    if ds_arr.shape[0] != n_subs and ds_arr.shape[1] == n_subs:
+        ds_arr = ds_arr.T
+    if ds_arr.shape[0] != n_subs:
+        raise ValueError(f"damage_state_samples shape {ds_arr.shape} incompatible with {n_subs} substations.")
+
+    n_mc = int(ds_arr.shape[1])
+    n_time = len(t_grid)
+    curves_by_ds = _precompute_ds_recovery_curves(
+        t_grid,
+        sub_index,
+        start_times=start_times,
+        method=method,
+    )
+
+    source_gate_enabled = bool(getattr(cfg, "SOURCE_GATE_ENABLED", True))
+    columns_norm = [clean_substation_id(s) for s in sub_index]
+    G_norm = nx.relabel_nodes(G, lambda n: clean_substation_id(n), copy=True) if G is not None else nx.Graph()
+    graph_nodes = {n for n in G_norm.nodes() if n}
+    if source_ids is None:
+        source_ids = load_source_gate_nodes(cfg, pd.Index(columns_norm))
+    valid_sources = {clean_substation_id(s) for s in source_ids} & graph_nodes & set(columns_norm)
+    valid_col_mask = np.array([c in graph_nodes for c in columns_norm], dtype=bool)
+
+    if source_gate_enabled and not valid_sources:
+        logger.warning(
+            "MC source gate%s: no valid source nodes overlap graph/substations; leaving recovery ungated.",
+            f" ({label})" if label else "",
+        )
+        source_gate_enabled = False
+
+    node_pos = {sid: i for i, sid in enumerate(columns_norm)}
+    gate_cache: Dict[bytes, np.ndarray] = {}
+
+    def _keep_mask_for_functional(functional_mask: np.ndarray) -> np.ndarray:
+        key = functional_mask.tobytes()
+        cached = gate_cache.get(key)
+        if cached is not None:
+            return cached
+
+        functional_mask = functional_mask & valid_col_mask
+        functional_nodes = [columns_norm[i] for i in np.flatnonzero(functional_mask)]
+        active_sources = valid_sources & set(functional_nodes)
+        keep = np.zeros(n_subs, dtype=bool)
+
+        if active_sources:
+            G_t = G_norm.subgraph(functional_nodes)
+            for component in nx.connected_components(G_t):
+                if active_sources.intersection(component):
+                    for node in component:
+                        pos = node_pos.get(node)
+                        if pos is not None:
+                            keep[pos] = True
+
+        gate_cache[key] = keep
+        return keep
+
+    threshold = float(getattr(cfg, "FUNCTIONAL_THRESHOLD", 0.5))
+    crossing_idx_by_ds = np.full((5, n_subs), n_time, dtype=np.int32)
+    for ds in range(5):
+        crosses = curves_by_ds[ds, :, :] >= threshold
+        has_crossing = crosses.any(axis=0)
+        if np.any(has_crossing):
+            crossing_idx_by_ds[ds, has_crossing] = np.argmax(crosses[:, has_crossing], axis=0)
+
+    sub_positions = np.arange(n_subs)
+    mc_source_gate_n_jobs = int(getattr(cfg, "MC_SOURCE_GATE_N_JOBS", 1) or 1)
+    if mc_source_gate_n_jobs < 0:
+        mc_source_gate_n_jobs = os.cpu_count() or 1
+    mc_source_gate_n_jobs = max(1, min(mc_source_gate_n_jobs, n_mc))
+
+    def _process_mc_range(mc_start: int, mc_stop: int) -> tuple[np.ndarray, int]:
+        local_sum = np.zeros((n_time, n_subs), dtype=np.float64)
+        for mc_idx in range(mc_start, mc_stop):
+            ds_vec = ds_arr[:, mc_idx]
+
+            if not source_gate_enabled:
+                local_sum += curves_by_ds[ds_vec, :, sub_positions].T
+                continue
+
+            crossing_idx = crossing_idx_by_ds[ds_vec, sub_positions]
+            event_idxs = np.unique(crossing_idx[crossing_idx < n_time])
+            if len(event_idxs) == 0:
+                continue
+
+            for event_pos, time_start in enumerate(event_idxs):
+                time_stop = int(event_idxs[event_pos + 1]) if event_pos + 1 < len(event_idxs) else n_time
+                time_start = int(time_start)
+                if time_start >= time_stop:
+                    continue
+                functional_mask = crossing_idx <= time_start
+                keep_mask = _keep_mask_for_functional(functional_mask)
+                if np.any(keep_mask):
+                    local_sum[time_start:time_stop, :] += (
+                        curves_by_ds[ds_vec, time_start:time_stop, sub_positions].T * keep_mask
+                    )
+        return local_sum, len(gate_cache)
+
+    if mc_source_gate_n_jobs == 1:
+        sum_recovery, _ = _process_mc_range(0, n_mc)
+    else:
+        chunk_edges = np.linspace(0, n_mc, mc_source_gate_n_jobs + 1, dtype=int)
+        ranges = [
+            (int(chunk_edges[i]), int(chunk_edges[i + 1]))
+            for i in range(mc_source_gate_n_jobs)
+            if chunk_edges[i] < chunk_edges[i + 1]
+        ]
+        results = Parallel(n_jobs=len(ranges))(
+            delayed(_process_mc_range)(mc_start, mc_stop)
+            for mc_start, mc_stop in ranges
+        )
+        sum_recovery = np.sum([item[0] for item in results], axis=0)
+
+    mean_recovery = sum_recovery / max(n_mc, 1)
+    logger.debug(
+        "MC source-gated recovery%s complete: n_mc=%d, n_time=%d, cached_gate_masks=%d.",
+        f" ({label})" if label else "",
+        n_mc,
+        n_time,
+        len(gate_cache),
+    )
+    return pd.DataFrame(np.clip(mean_recovery, 0.0, 1.0), index=t_grid, columns=sub_index)
 
 
 def propagate_to_tracts(
@@ -1636,7 +2422,7 @@ def compute_graph_robustness(
         - A node is considered functional at time t if its series value > 0.5
     """
     logger = logging.getLogger()
-    logger.info("Computing dynamic graph robustness (Metric: Average Degree)...")
+    logger.debug("Computing dynamic graph robustness (Metric: Average Degree)...")
 
     if sub_series_df.empty or G.number_of_nodes() == 0:
         return pd.DataFrame(columns=["t", "lcc_size", "avg_degree", "lcc_fraction"])
@@ -1778,15 +2564,20 @@ def run_stage_3(
     tract_index = stage_0_data["tract_index"]
     sub_index = stage_0_data["sub_index"]
     G = stage_2_data.get("G", nx.Graph())
+    source_ids = load_source_gate_nodes(cfg, sub_index) if getattr(cfg, "SOURCE_GATE_ENABLED", True) else set()
+    if getattr(cfg, "SOURCE_GATE_ENABLED", True):
+        logger.info("Source gate enabled: %d active source nodes.", len(source_ids))
 
     # --- 2. Simulation Loop ---
     t_grid = np.arange(0, cfg.TIME_END_HR + cfg.DT_HR, cfg.DT_HR)
     
     # Output Containers
-    all_damage_probs = {}          # <--- Critical for Stage 4/5 (The "Model")
+    all_damage_probs = {}          # Damage-state probabilities retained for diagnostics/audits.
+    all_damage_state_samples = {}
     all_mean_sub_repair_times = {} # Logistics: Duration for Crew Scheduling
     all_mean_sub_init_func0 = {}   # Consistency: t=0 state
     all_mean_tract_series = {}
+    repair_task_audit_frames = []
 
     for scenario in cfg.SCENARIOS:
         logger.info(f"Processing scenario: {scenario}...")
@@ -1797,7 +2588,9 @@ def run_stage_3(
             logger.error(f"Missing Stage 1 records file: {recs_path}")
             continue
         df_recs = pd.read_csv(recs_path)
-        df_recs["substation_id"] = df_recs["substation_id"].astype(str).str.strip()
+        df_recs["substation_id"] = df_recs["substation_id"].map(clean_substation_id)
+        damage_state_samples = _damage_records_to_state_matrix(df_recs, sub_index)
+        all_damage_state_samples[scenario] = damage_state_samples
 
         # B. Calculate Damage Probabilities (Aggregation)
         # Count frequency of DS0, DS1, DS2... for each substation
@@ -1810,14 +2603,17 @@ def run_stage_3(
         # Store for later stages
         all_damage_probs[scenario] = ds_probs
 
-        # C. Simulate Recovery Curve (Theoretical Best Case)
-        # Uses the new engine. start_times=None means everyone starts at t=0.
-        logger.info(f"Generating expected Hazus S-Curves for {scenario}...")
-        R_sub_mean_df = simulate_recovery(
-            t_grid, 
-            sub_index, 
-            ds_probs, 
-            start_times=None
+        # C. Simulate recovery as E[gate(F_run(t))]: source connectivity is
+        # evaluated per MC realization before averaging.
+        R_sub_mean_df = simulate_recovery_mc_source_gated(
+            t_grid,
+            sub_index,
+            damage_state_samples,
+            G,
+            cfg,
+            source_ids=source_ids,
+            start_times=None,
+            label=f"Stage3_{scenario}",
         )
 
         # D. Logistics: Calculate Mean Duration for Scheduling
@@ -1829,6 +2625,20 @@ def run_stage_3(
         
         all_mean_sub_repair_times[scenario] = pd.Series(
             mean_vals, index=sub_index, name="mean_repair_time_hr"
+        )
+        repair_audit = build_repair_task_threshold_audit(
+            scenario,
+            all_mean_sub_repair_times[scenario],
+            ds_probs,
+            cfg,
+        )
+        repair_task_audit_frames.append(repair_audit)
+        logger.info(
+            "Repair task filter for %s: mean repair >= %.2f hr -> %d/%d dispatch tasks.",
+            scenario,
+            float(repair_audit["task_threshold_hr"].iloc[0]),
+            int(repair_audit["is_repair_task"].sum()),
+            len(repair_audit),
         )
         
         # Capture t=0 state from the generated curve
@@ -1848,18 +2658,23 @@ def run_stage_3(
         # Log System T50
         system_curve = S_tract_mean_df.mean(axis=1)
         sys_t50 = system_curve.index[np.argmax(system_curve.values >= 0.5)] if system_curve.max() >= 0.5 else -1
-        logger.info(f"Scenario {scenario} System T50: {sys_t50} hr")
+        logger.info(f"Scenario {scenario} tract-mean T50: {sys_t50} hr")
 
         # G. Graph Robustness
         if G.number_of_nodes() > 0:
             robust_df = compute_graph_robustness(G, R_sub_mean_df, t_grid, cfg)
             robust_df.to_csv(out_dirs["STAGE3_DIR"] / f"graph_robustness_mean_{scenario}.csv", index=False)
 
+    if repair_task_audit_frames:
+        audit_path = out_dirs["STAGE3_DIR"] / "repair_task_threshold_audit.csv"
+        pd.concat(repair_task_audit_frames, ignore_index=True).to_csv(audit_path, index=False)
+        logger.info("Repair task threshold audit saved to %s", audit_path)
+
     logger.info("--- STAGE 3 Complete ---")
     
-    # RETURN the probability table so Stage 4/5 can use it!
     return {
-        "all_damage_probs": all_damage_probs,           # <--- NEW
+        "all_damage_probs": all_damage_probs,
+        "all_damage_state_samples": all_damage_state_samples,
         "all_mean_sub_repair_times": all_mean_sub_repair_times,
         "all_mean_sub_init_func0": all_mean_sub_init_func0,
         "all_mean_tract_series": all_mean_tract_series,
@@ -1870,11 +2685,214 @@ def run_stage_3(
 # [PART 6] Stage 4: Crew Scheduling & Repair Logistics (Rule-Based)
 # =============================================================================
 # Contains: Travel matrices, Substation ordering rules, Scheduling engine, run_stage_4
+def _timestamped_backup(path: Path) -> Optional[Path]:
+    """Create one timestamped backup for a file during this process."""
+    if not path.exists():
+        return None
+    resolved = str(path.resolve())
+    if resolved in _TIMESTAMPED_BACKUPS_CREATED:
+        return None
+    ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = path.with_name(f"{path.stem}.backup_{ts}{path.suffix}")
+    import shutil
+
+    shutil.copy2(path, backup_path)
+    _TIMESTAMPED_BACKUPS_CREATED.add(resolved)
+    return backup_path
+
+
+def load_stage45_C57_depot_inputs(data_dir, depot_csv: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load and validate the finalized C57 Stage 4/5 depot input.
+
+    Returns all D01-D16 depots, active depots with integer_crews > 0, utility
+    totals, and one expanded row per dispatchable crew.
+    """
+    data_dir = Path(data_dir)
+    depot_path = Path(depot_csv) if depot_csv else data_dir / "stage45_depot_inputs_final_origin_proxy.csv"
+    if not depot_path.exists():
+        raise FileNotFoundError(f"Stage 4/5 C57 depot input not found: {depot_path}")
+
+    scenario_label = "C57_substation_ratio_main"
+    allocation_label = "C57_yard_allocation_no_deletion_tie_coherent_zero_low"
+    expected_ids = [f"D{i:02d}" for i in range(1, 17)]
+    active_ids = ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D09", "D10", "D12", "D13"]
+    inactive_ids = ["D08", "D11", "D14", "D15", "D16"]
+
+    df = pd.read_csv(depot_path)
+    df = df.rename(
+        columns={
+            "yard_id": "depot_id",
+            "facility": "depot_name",
+        }
+    )
+    if "depot_id" not in df.columns:
+        raise ValueError("C57 depot input must contain depot_id.")
+
+    df["depot_id"] = df["depot_id"].astype(str).str.strip()
+    if df["depot_id"].duplicated().any():
+        dupes = sorted(df.loc[df["depot_id"].duplicated(), "depot_id"].unique())
+        raise ValueError(f"Duplicate C57 depot_id values: {dupes}")
+
+    missing = sorted(set(expected_ids) - set(df["depot_id"]))
+    extra = sorted(set(df["depot_id"]) - set(expected_ids))
+    if len(df) != 16 or missing or extra:
+        raise ValueError(f"C57 depot input must be exactly D01-D16. missing={missing}, extra={extra}, rows={len(df)}")
+
+    allocation_cols = [
+        "scenario_label",
+        "allocation_label",
+        "raw_visual_weight",
+        "fractional_crews",
+        "integer_crews",
+        "active_in_integer_input",
+    ]
+    if any(c not in df.columns for c in allocation_cols):
+        active_path = data_dir / "stage45_active_crew_bases_C57.csv"
+        if active_path.exists():
+            active_alloc = pd.read_csv(active_path).rename(
+                columns={
+                    "yard_id": "depot_id",
+                    "facility": "depot_name",
+                }
+            )
+            active_alloc["depot_id"] = active_alloc["depot_id"].astype(str).str.strip()
+            merge_cols = ["depot_id"] + [
+                c for c in allocation_cols if c not in df.columns and c in active_alloc.columns
+            ]
+            if len(merge_cols) > 1:
+                df = df.merge(active_alloc[merge_cols], on="depot_id", how="left")
+
+    defaults = {
+        "scenario_label": scenario_label,
+        "allocation_label": allocation_label,
+        "raw_visual_weight": 0.0,
+        "fractional_crews": 0.0,
+        "integer_crews": 0,
+        "active_in_integer_input": "no",
+    }
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
+        else:
+            df[col] = df[col].fillna(default)
+    df.loc[pd.to_numeric(df["integer_crews"], errors="coerce").fillna(0) > 0, "active_in_integer_input"] = "yes"
+
+    required = [
+        "depot_name",
+        "utility",
+        "latitude",
+        "longitude",
+        "scenario_label",
+        "allocation_label",
+        "raw_visual_weight",
+        "fractional_crews",
+        "integer_crews",
+        "active_in_integer_input",
+    ]
+    missing_cols = [c for c in required if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"C57 depot input missing required columns: {missing_cols}")
+
+    if set(df["scenario_label"].astype(str)) != {scenario_label}:
+        raise ValueError("C57 depot scenario_label validation failed.")
+    if set(df["allocation_label"].astype(str)) != {allocation_label}:
+        raise ValueError("C57 depot allocation_label validation failed.")
+
+    df["integer_crews"] = pd.to_numeric(df["integer_crews"], errors="raise").astype(int)
+    df["fractional_crews"] = pd.to_numeric(df["fractional_crews"], errors="raise")
+    df["raw_visual_weight"] = pd.to_numeric(df["raw_visual_weight"], errors="raise")
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="raise")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="raise")
+
+    if int(df["integer_crews"].sum()) != 57:
+        raise ValueError(f"C57 total integer crews must be 57, got {int(df['integer_crews'].sum())}.")
+    ladwp_total = int(df[df["depot_id"].isin(expected_ids[:6])]["integer_crews"].sum())
+    sce_total = int(df[df["depot_id"].isin(expected_ids[6:])]["integer_crews"].sum())
+    if ladwp_total != 47 or sce_total != 10:
+        raise ValueError(f"C57 utility crew totals invalid: LADWP={ladwp_total}, SCE={sce_total}.")
+
+    actual_active = sorted(df.loc[df["integer_crews"] > 0, "depot_id"].tolist())
+    actual_inactive = sorted(df.loc[df["integer_crews"] == 0, "depot_id"].tolist())
+    if actual_active != sorted(active_ids):
+        raise ValueError(f"C57 active yard set invalid: {actual_active}")
+    if actual_inactive != sorted(inactive_ids):
+        raise ValueError(f"C57 inactive yard set invalid: {actual_inactive}")
+    active_flag = df["active_in_integer_input"].astype(str).str.strip().str.lower()
+    if not (active_flag[df["integer_crews"] > 0] == "yes").all():
+        raise ValueError("C57 active depot rows must have active_in_integer_input=yes.")
+    if not (active_flag[df["integer_crews"] == 0] == "no").all():
+        raise ValueError("C57 inactive depot rows must have active_in_integer_input=no.")
+
+    active_df = df[df["integer_crews"] > 0].copy()
+    if active_df[["latitude", "longitude"]].isna().any().any():
+        raise ValueError("C57 active depot rows must have non-null coordinates.")
+
+    rename_map = {"depot_id": "yard_id", "depot_name": "facility"}
+    full_df = df.rename(columns=rename_map).copy()
+    active_df = active_df.rename(columns=rename_map).copy()
+    for out_df in (full_df, active_df):
+        out_df["travel_matrix_origin_key"] = out_df["yard_id"]
+
+    expanded_rows = []
+    crew_idx = 0
+    for _, row in active_df.iterrows():
+        for _ in range(int(row["integer_crews"])):
+            expanded_rows.append(
+                {
+                    "crew_origin_index": crew_idx,
+                    "crew_id": f"C57_crew_{crew_idx + 1:02d}",
+                    "yard_id": row["yard_id"],
+                    "utility": row["utility"],
+                    "facility": row["facility"],
+                    "latitude": row["latitude"],
+                    "longitude": row["longitude"],
+                    "travel_matrix_origin_key": row["travel_matrix_origin_key"],
+                }
+            )
+            crew_idx += 1
+    expanded_df = pd.DataFrame(expanded_rows)
+    if len(expanded_df) != 57:
+        raise ValueError(f"C57 expanded crew origins must contain 57 rows, got {len(expanded_df)}.")
+
+    return {
+        "depot_path": depot_path,
+        "full_depot_df": full_df,
+        "active_depot_df": active_df,
+        "expanded_crew_origins_df": expanded_df,
+        "total_integer_crews": 57,
+        "utility_totals": {"LADWP": ladwp_total, "SCE": sce_total},
+        "active_ids": active_ids,
+        "inactive_ids": inactive_ids,
+    }
+
+
+def write_stage45_C57_base_outputs(cfg: Config, depot_inputs: Dict[str, Any]) -> None:
+    """Write C57 active/all/expanded crew-origin audit outputs."""
+    active_cols = [
+        "yard_id",
+        "utility",
+        "facility",
+        "integer_crews",
+        "fractional_crews",
+        "raw_visual_weight",
+        "latitude",
+        "longitude",
+        "scenario_label",
+        "allocation_label",
+        "travel_matrix_origin_key",
+    ]
+    depot_inputs["active_depot_df"][active_cols].to_csv(cfg.STAGE45_ACTIVE_CREW_BASES_CSV, index=False)
+    depot_inputs["full_depot_df"].to_csv(cfg.STAGE45_ALL_DEPOT_AUDIT_CSV, index=False)
+    depot_inputs["expanded_crew_origins_df"].to_csv(cfg.STAGE45_EXPANDED_CREW_ORIGINS_CSV, index=False)
+
+
 def load_travel_matrices(
     cfg,
     devices_df: pd.DataFrame,
     task_sub_ids: list,
     all_sub_ids: list,
+    active_depot_df: Optional[pd.DataFrame] = None,
 ) -> dict:
     """
     Load or generate travel-time matrices:
@@ -1899,10 +2917,17 @@ def load_travel_matrices(
     force_regen_task = False
     all_sub_ids_set = set(all_sub_ids)
 
-    # Expand crew bases: each base becomes a unique base_id (base_0, base_1, ...)
+    if active_depot_df is None:
+        raise ValueError("C57 travel matrix loading requires active_depot_df.")
+
     crew_bases_expanded = [
-        (name, lat, lon, f"base_{idx}")
-        for idx, (name, lat, lon) in enumerate(cfg.CREW_BASES)
+        (
+            str(row["facility"]),
+            float(row["latitude"]),
+            float(row["longitude"]),
+            str(row["travel_matrix_origin_key"]),
+        )
+        for _, row in active_depot_df.iterrows()
     ]
     crew_base_ids = [c[3] for c in crew_bases_expanded]
 
@@ -1918,7 +2943,7 @@ def load_travel_matrices(
     # 1) Base -> Task matrix
     # =========================================================================
     if base_to_task_path.exists():
-        logger.info(f"[Travel] Loading Base->Task CSV: {base_to_task_path}")
+        logger.debug("[Travel] Loading Base->Task CSV: %s", base_to_task_path)
         base_to_task = pd.read_csv(base_to_task_path, index_col=0)
 
         # Normalize IDs (string + strip) to improve matching robustness
@@ -1938,6 +2963,7 @@ def load_travel_matrices(
 
     if (not base_to_task_path.exists()) or force_regen_base:
         logger.warning("[Travel] Generating fallback Base->Task matrix (Haversine/Geodesic)...")
+        _timestamped_backup(base_to_task_path)
 
         data = {}
         for name, lat_b, lon_b, base_id in crew_bases_expanded:
@@ -1958,7 +2984,7 @@ def load_travel_matrices(
     # 2) Task -> Task matrix
     # =========================================================================
     if task_to_task_path.exists():
-        logger.info(f"[Travel] Loading Task->Task CSV: {task_to_task_path}")
+        logger.debug("[Travel] Loading Task->Task CSV: %s", task_to_task_path)
         task_to_task = pd.read_csv(task_to_task_path, index_col=0)
 
         # Normalize IDs
@@ -2091,21 +3117,27 @@ def order_substations(
 
         try:
             hospital_tracts_df = pd.read_csv(cfg.HOSPITAL_TRACTS_CSV)
+            geo_col = "geoid"
+            for cand in ["GEOID", "tract_id", "TRACTFIPS", "geoid"]:
+                if cand in hospital_tracts_df.columns:
+                    geo_col = cand
+                    break
+            
             hosp_tract_ids = set(
-                hospital_tracts_df["geoid"]
+                hospital_tracts_df[geo_col]
                 .astype(str)
                 .str.strip()
                 .str.replace(r"\.0$", "", regex=True)
             )
         except Exception as e:
-            logger.warning(f"Hospital data load failed: {e}. Falling back to random.")
-            return order_substations("random", task_sub_ids, stage_0_data, stage_2_data, cfg)
+            logger.critical(f"CRITICAL FAILURE in 'hospital-first': Could not load hospital data. Error: {e}")
+            raise e
 
         m = mapping_df.copy()
         m["tract_id_clean"] = (
             m["tract_id"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
         )
-        m["substation_id"] = m["substation_id"].astype(str).str.strip()
+        m["substation_id"] = m["substation_id"].map(clean_substation_id)
         m["is_hosp_tract"] = m["tract_id_clean"].isin(hosp_tract_ids)
 
         sub_hosp_priority = m.groupby("substation_id")["is_hosp_tract"].sum()
@@ -2135,12 +3167,15 @@ def simulate_rule_schedule(
     sub_repair_durations: pd.Series,
     sub_index: pd.Index,
     cfg: Config,
-    damage_probs: pd.DataFrame,      # <--- NEW: Required for Hazus curves
+    damage_state_samples: np.ndarray,
     log_tag: str = None,
+    crew_origin_ids: Optional[List[str]] = None,
+    source_gate_graph: Optional[nx.Graph] = None,
+    source_ids: Optional[set[str]] = None,
     # initial_values removed (Obsolute)
 ) -> pd.DataFrame:
     """
-    Simulate a multi-crew repair schedule and generate Hazus recovery curves.
+    Simulate a multi-crew repair schedule and generate MC source-gated Hazus recovery curves.
     """
     logger = logging.getLogger()
 
@@ -2166,23 +3201,17 @@ def simulate_rule_schedule(
     base_id_set = set(base_ids)
 
     # --- 2. Initialize State ---
-    crew_clocks = np.zeros(n_crews)
-    n_local = getattr(cfg, "N_CREWS_LOCAL", 15)   
-    n_local = min(n_local, n_crews)   
-    arrival_delay = getattr(cfg, "MUTUAL_AID_DELAY_HR", 8.0)
-    
-    crew_clocks[:n_local] = 0.0
-    if n_crews > n_local:
-        crew_clocks[n_local:] = arrival_delay
-        if log_tag: 
-            print(f"   -> [Logistics] {n_local} crews start at T=0, {n_crews - n_local} crews arrive at T={arrival_delay}h")
+    if crew_origin_ids is None:
+        raise ValueError("C57 schedule simulation requires crew_origin_ids.")
 
-    # Assign initial locations
-    if base_ids:
-        repeated = (base_ids * ((n_crews // len(base_ids)) + 1))[:n_crews]
-        crew_locations = repeated.copy()
-    else:
-        crew_locations = [None] * n_crews
+    crew_clocks = np.zeros(n_crews)
+    crew_origin_ids_clean = [str(x).strip() for x in crew_origin_ids]
+    crew_locations = list(crew_origin_ids_clean)
+    if len(crew_origin_ids_clean) != n_crews:
+        raise ValueError(f"crew_origin_ids length {len(crew_origin_ids_clean)} != n_crews {n_crews}")
+    missing_origins = sorted(set(crew_origin_ids_clean) - base_id_set)
+    if missing_origins:
+        raise ValueError(f"Crew origin IDs missing from base_to_task matrix: {missing_origins}")
 
     # Track END times (Logistics). Default to Inf (never fixed).
     sub_end_times = pd.Series(np.inf, index=sub_index)
@@ -2239,6 +3268,7 @@ def simulate_rule_schedule(
             GLOBAL_GANTT_LOG.append({
                 "Stage": log_tag,
                 "Crew_ID": next_crew_idx,
+                "Crew_Origin_ID": crew_origin_ids_clean[next_crew_idx],
                 "Substation_ID": next_task_id,
                 "Start_Time": arrival_time,
                 "End_Time": end_time,
@@ -2259,12 +3289,24 @@ def simulate_rule_schedule(
     
     aligned_durations = sub_repair_durations.reindex(sub_index, fill_value=0.0)
     repair_starts = sub_end_times - aligned_durations
+    task_threshold_hr = get_repair_task_threshold_hr(cfg)
+    no_dispatch_mask = (~np.isfinite(repair_starts.values)) & (aligned_durations.values < task_threshold_hr)
+    if np.any(no_dispatch_mask):
+        # Minor expected workloads are not field-dispatch tasks; let them recover from t=0.
+        repair_starts.iloc[no_dispatch_mask] = 0.0
 
-    return simulate_recovery(
-        t_grid=t_grid, 
-        sub_index=sub_index, 
-        damage_probs=damage_probs,
-        start_times=repair_starts.values
+    if damage_state_samples is None:
+        raise ValueError("simulate_rule_schedule requires MC damage_state_samples for source-gated recovery.")
+
+    return simulate_recovery_mc_source_gated(
+        t_grid=t_grid,
+        sub_index=sub_index,
+        damage_state_samples=damage_state_samples,
+        G=source_gate_graph if source_gate_graph is not None else nx.Graph(),
+        cfg=cfg,
+        source_ids=source_ids,
+        start_times=repair_starts.values,
+        label=log_tag or "",
     )
 
 
@@ -2283,6 +3325,7 @@ def get_analysis_weights(cfg: Config, stage_0_data: Dict) -> Tuple[np.ndarray, O
 
     mapping_df = stage_0_data.get("mapping_df")
     tract_index = stage_0_data.get("tract_index")
+    total_pop = 0.0
 
     # -------------------------------------------------------------------------
     # 1) Population weights (Population / TotalPopulation)
@@ -2348,7 +3391,7 @@ def get_analysis_weights(cfg: Config, stage_0_data: Dict) -> Tuple[np.ndarray, O
 
                 if raw_w.sum() > 0:
                     svi_pop_weights = raw_w / raw_w.sum()
-                    logger.info("SVI weights calculated successfully for analysis.")
+                    logger.debug("SVI weights calculated successfully for analysis.")
 
         except Exception as e:
             logger.warning(f"Failed to calculate SVI weights: {e}")
@@ -2389,14 +3432,14 @@ def run_stage_4(
         logger.error("FATAL: Missing 'all_mean_sub_repair_times'. Stage 3 might have failed.")
         return {}
 
-    # NEW: Retrieve Damage Probabilities from Stage 3
-    all_damage_probs = stage_3_data.get("all_damage_probs")
-    if not all_damage_probs:
-        logger.error("FATAL: Missing 'all_damage_probs'. Stage 3 (Hazus Aggregation) must run first.")
+    all_damage_state_samples = stage_3_data.get("all_damage_state_samples", {})
+    if not all_damage_state_samples:
+        logger.error("FATAL: Missing 'all_damage_state_samples'. Stage 3 must run before Stage 4.")
         return {}
 
     # Load Graph
     G = stage_2_data.get("G", nx.Graph())
+    source_ids = load_source_gate_nodes(cfg, sub_index) if getattr(cfg, "SOURCE_GATE_ENABLED", True) else set()
 
     # Simulation Grid
     t_grid = np.arange(0, cfg.TIME_END_HR + cfg.DT_HR, cfg.DT_HR)
@@ -2405,6 +3448,17 @@ def run_stage_4(
     pop_weights, svi_pop_weights = get_analysis_weights(cfg, stage_0_data)
     if svi_pop_weights is None:
         logger.warning("SVI weights not available. SVI curves will not be generated.")
+
+    depot_inputs = load_stage45_C57_depot_inputs(DATA_DIR, getattr(cfg, "STAGE45_DEPOT_INPUT_CSV", None))
+    write_stage45_C57_base_outputs(cfg, depot_inputs)
+    active_depot_df = depot_inputs["active_depot_df"]
+    crew_origin_ids = depot_inputs["expanded_crew_origins_df"]["travel_matrix_origin_key"].astype(str).tolist()
+    n_c57_crews = int(depot_inputs["total_integer_crews"])
+    logger.info(
+        "Stage 4 using C57 depot CSV: %d active bases, %d expanded crews.",
+        len(active_depot_df),
+        n_c57_crews,
+    )
 
     # Rules to Simulate
     rules = [
@@ -2431,12 +3485,23 @@ def run_stage_4(
 
         # Get Scenario Data
         sub_repair_durations = all_mean_sub_repair_times[scenario]
-        damage_probs = all_damage_probs[scenario]  # <--- NEW: The Hazus Weights
+        damage_state_samples = all_damage_state_samples.get(scenario)
+        if damage_state_samples is None:
+            logger.error("FATAL: Missing MC damage-state samples for %s. Cannot run Stage 4 recovery.", scenario)
+            continue
 
-        # Identify Damaged Substations (Logistics Only)
-        # We filter tasks for the scheduler based on mean repair time > 0
-        tasks_to_do_series = sub_repair_durations[sub_repair_durations > 0.001]
+        # Identify dispatchable field-repair tasks.
+        # Minor expected workloads below the DS1-equivalent threshold recover from t=0
+        # and do not consume crew time.
+        tasks_to_do_series, task_threshold_hr = select_repair_tasks(sub_repair_durations, cfg)
         task_sub_ids = list(tasks_to_do_series.index)
+        logger.info(
+            "Stage 4 task filter for %s: mean repair >= %.2f hr -> %d/%d tasks.",
+            scenario,
+            task_threshold_hr,
+            len(task_sub_ids),
+            len(sub_repair_durations),
+        )
 
         if not task_sub_ids:
             logger.warning(f"No damaged substations for {scenario}. Skipping.")
@@ -2448,6 +3513,7 @@ def run_stage_4(
             devices_df,
             task_sub_ids,
             sub_index.to_list(),
+            active_depot_df=active_depot_df,
         )
 
         # Local Containers for this Scenario
@@ -2458,23 +3524,25 @@ def run_stage_4(
 
         # --- Run Each Rule ---
         for rule in rules:
-            logger.info(f"   - Simulating rule: {rule}")
+            logger.debug("Simulating Stage 4 rule for %s: %s", scenario, rule)
 
             # A. Determine Repair Order
             order = order_substations(rule, task_sub_ids, stage_0_data, stage_2_data, cfg)
 
-            # B. Simulate Schedule & Recovery
-            # UPDATED CALL: Pass damage_probs, Remove initial_values
+            # B. Simulate schedule and MC source-gated recovery.
             R_sub_df = simulate_rule_schedule(
                 order=order,
-                n_crews=cfg.N_CREWS,
+                n_crews=n_c57_crews,
                 travel_mats=travel_mats,
                 t_grid=t_grid,
                 sub_repair_durations=sub_repair_durations,
                 sub_index=sub_index,
                 cfg=cfg,
-                damage_probs=damage_probs,       # <--- Pass the Hazus data
+                damage_state_samples=damage_state_samples,
                 log_tag=f"Stage4_{scenario}_{rule}",
+                crew_origin_ids=crew_origin_ids,
+                source_gate_graph=G,
+                source_ids=source_ids,
                 # initial_values removed (Obsolute)
             )
 
@@ -2535,7 +3603,13 @@ def run_stage_4(
             kpis_svi_df = pd.concat(scenario_kpis_svi.values())
             kpis_svi_df.to_csv(out_dir / f"rule_kpis_svi_{scenario}.csv", index=False)
 
-        logger.info(f"Wrote rule-based curves to {out_dir} for {scenario}")
+        logger.info(
+            "Completed Stage 4 schedules for %s: %d rules, %d damaged tasks.",
+            scenario,
+            len(scenario_curves_pop),
+            len(task_sub_ids),
+        )
+        logger.debug("Wrote rule-based curves to %s for %s", out_dir, scenario)
 
         stage_4_data[scenario] = {
             "system_curves_pop": df_pop,
@@ -2552,7 +3626,8 @@ def run_stage_4(
         df_s4 = pd.DataFrame(s4_gantt_data)
         gantt_path = out_dir / "Gantt_Data_Stage4.csv"
         df_s4.to_csv(gantt_path, index=False)
-        logger.info(f"SAVED GANTT DATA: {gantt_path} (Rows: {len(df_s4)})")
+        logger.info("Stage 4 Gantt data written: %d rows.", len(df_s4))
+        logger.debug("Stage 4 Gantt path: %s", gantt_path)
     else:
         logger.warning("No Gantt data found for Stage 4.")
 
@@ -2582,32 +3657,43 @@ def run_stage_5(
     logger.info("--- STAGE 5: Genetic Algorithm Optimization (Hazus Probabilistic) ---")
 
     # --- 1. Helpers & Inputs ---
-    def _clean_id(x): return str(x).split(".")[0].strip()
     def _norm01(x, eps=1e-12):
         x = np.asarray(x, dtype=float)
         mn, mx = float(np.min(x)), float(np.max(x))
         return (x - mn) / (mx - mn + eps)
 
     all_mean_sub = stage_3_data["all_mean_sub_repair_times"]
-    all_damage_probs = stage_3_data.get("all_damage_probs")
-    if not all_damage_probs:
-        logger.error("FATAL: Missing 'all_damage_probs'. Stage 3 must be run first.")
+    all_damage_state_samples = stage_3_data.get("all_damage_state_samples", {})
+    if not all_damage_state_samples:
+        logger.error("FATAL: Missing 'all_damage_state_samples'. Stage 3 must be run first.")
         return {}
 
     W_mat = stage_0_data["W_mat"]
     sub_index = stage_0_data["sub_index"]
     tract_index = stage_0_data["tract_index"]
 
-    sub_index_str = [_clean_id(s) for s in list(sub_index)]
+    sub_index_str = [clean_substation_id(s) for s in list(sub_index)]
     sub_idx_map = {sid: i for i, sid in enumerate(sub_index_str)}
     out_dir_s5 = out_dirs["STAGE5_DIR"]
 
     # --- Build base graph once for GA graph-robustness export ---
     devices_merged = stage_0_data["devices_merged"].copy()
     devices_merged = ensure_substation_id_col(devices_merged)
-    devices_merged["substation_id"] = devices_merged["substation_id"].astype(str).str.strip()
+    devices_merged["substation_id"] = devices_merged["substation_id"].map(clean_substation_id)
 
     G = build_base_graph(cfg, devices_merged, sub_index)
+    source_ids = load_source_gate_nodes(cfg, sub_index) if getattr(cfg, "SOURCE_GATE_ENABLED", True) else set()
+
+    depot_inputs = load_stage45_C57_depot_inputs(DATA_DIR, getattr(cfg, "STAGE45_DEPOT_INPUT_CSV", None))
+    write_stage45_C57_base_outputs(cfg, depot_inputs)
+    active_depot_df = depot_inputs["active_depot_df"]
+    crew_origin_ids = depot_inputs["expanded_crew_origins_df"]["travel_matrix_origin_key"].astype(str).tolist()
+    n_c57_crews = int(depot_inputs["total_integer_crews"])
+    logger.info(
+        "Stage 5 using C57 depot CSV: %d active bases, %d expanded crews.",
+        len(active_depot_df),
+        n_c57_crews,
+    )
 
     # --- 2. Prepare Importance Vectors ---
     mapping_df = stage_0_data["mapping_df"]
@@ -2635,6 +3721,72 @@ def run_stage_5(
         sub_hosp_score = is_hosp.values @ W_mat
     except Exception:
         sub_hosp_score = np.zeros(len(sub_index_str))
+
+    def _build_node_importance_components() -> pd.DataFrame:
+        attr = devices_merged.copy()
+        attr = ensure_substation_id_col(attr)
+        attr["substation_id"] = attr["substation_id"].map(clean_substation_id)
+
+        voltage_col = next((c for c in ["MAX_VOLT", "MAX_VOLT_N", "voltage_for_fragility"] if c in attr.columns), None)
+        lines_col = next((c for c in ["LINES", "lines"] if c in attr.columns), None)
+
+        base_attr = pd.DataFrame(index=pd.Index(sub_index_str, name="substation_id"))
+        if voltage_col is not None:
+            voltage = pd.to_numeric(attr[voltage_col], errors="coerce")
+            voltage = voltage.where(voltage > 0)
+            base_attr["MAX_VOLT"] = voltage.groupby(attr["substation_id"]).max()
+        else:
+            base_attr["MAX_VOLT"] = np.nan
+
+        if lines_col is not None:
+            lines = pd.to_numeric(attr[lines_col], errors="coerce")
+            lines = lines.where(lines > 0, 0.0)
+            base_attr["LINES"] = lines.groupby(attr["substation_id"]).max()
+        else:
+            base_attr["LINES"] = 0.0
+
+        base_attr = base_attr.reindex(sub_index_str)
+
+        source_roles = load_source_role_table(cfg, sub_index=base_attr.index)
+        if source_roles.empty:
+            role_score = pd.Series(0.0, index=base_attr.index)
+            role_matched = pd.Series(False, index=base_attr.index)
+        else:
+            role_score = (
+                source_roles.set_index("substation_id")["source_role_score"]
+                .reindex(base_attr.index)
+                .fillna(0.0)
+            )
+            role_matched = base_attr.index.to_series().isin(source_roles["substation_id"])
+
+        voltage_map = {66: 0.20, 69: 0.20, 115: 0.50, 138: 0.50, 230: 0.80, 500: 1.00}
+        voltage_score = (
+            pd.to_numeric(base_attr["MAX_VOLT"], errors="coerce")
+            .round()
+            .astype("Int64")
+            .map(voltage_map)
+            .fillna(0.0)
+        )
+        lines_scale = float(getattr(cfg, "STAGE5_NODE_IMPORTANCE_LINES_SCALE", 12.0))
+        lines_score = pd.to_numeric(base_attr["LINES"], errors="coerce").fillna(0.0) / lines_scale
+
+        w_role = float(getattr(cfg, "STAGE5_NODE_IMPORTANCE_ROLE_WEIGHT", 0.70))
+        w_voltage = float(getattr(cfg, "STAGE5_NODE_IMPORTANCE_VOLTAGE_WEIGHT", 0.20))
+        w_lines = float(getattr(cfg, "STAGE5_NODE_IMPORTANCE_LINES_WEIGHT", 0.10))
+        node_score = w_role * role_score.values + w_voltage * voltage_score.values + w_lines * lines_score
+
+        return pd.DataFrame(
+            {
+                "node_importance_score": node_score,
+                "importance_role_score": role_score.values,
+                "importance_voltage_score": voltage_score.values,
+                "importance_lines_score": lines_score,
+                "importance_table_matched": role_matched.values,
+            },
+            index=base_attr.index,
+        )
+
+    node_importance_df = _build_node_importance_components()
 
     # --- 3. DEAP (GA) Setup ---
     if not hasattr(creator, "FitnessMax"):
@@ -2670,39 +3822,83 @@ def run_stage_5(
             continue
 
         repair_times = all_mean_sub[scenario]
-        damage_probs = all_damage_probs[scenario]
+        damage_state_samples = all_damage_state_samples.get(scenario)
+        if damage_state_samples is None:
+            logger.error("FATAL: Missing MC damage-state samples for %s. Cannot run Stage 5 recovery.", scenario)
+            continue
 
-        # Identify tasks (Logistics uses repair time > 0 to identify candidates)
-        tasks = repair_times[repair_times > 0.1]
+        # Identify dispatchable field-repair tasks using the same threshold as Stage 4.
+        tasks, task_threshold_hr = select_repair_tasks(repair_times, cfg)
         task_ids = list(tasks.index)
         n_tasks = len(task_ids)
+        logger.info(
+            "Stage 5 task filter for %s: mean repair >= %.2f hr -> %d/%d tasks.",
+            scenario,
+            task_threshold_hr,
+            n_tasks,
+            len(repair_times),
+        )
         if n_tasks == 0:
             continue
 
-        tmats = load_travel_matrices(cfg, stage_0_data["devices_merged"], task_ids, list(sub_index))
+        tmats = load_travel_matrices(
+            cfg,
+            stage_0_data["devices_merged"],
+            task_ids,
+            list(sub_index),
+            active_depot_df=active_depot_df,
+        )
         base_mat = tmats["base_to_task"].values
         task_mat = tmats["task_to_task"].values
-        n_bases = int(base_mat.shape[0])
-        crew_base_idx = np.array((list(range(n_bases)) * ((cfg.N_CREWS // n_bases) + 1))[: cfg.N_CREWS], dtype=int)
+        base_ids = tmats["base_to_task"].index.astype(str).tolist()
+        base_idx_map = {bid: i for i, bid in enumerate(base_ids)}
+        missing_crew_origins = sorted(set(crew_origin_ids) - set(base_ids))
+        if missing_crew_origins:
+            raise ValueError(f"C57 crew origins missing from Stage 5 base matrix: {missing_crew_origins}")
+        crew_base_idx = np.array([base_idx_map[origin_id] for origin_id in crew_origin_ids], dtype=int)
 
-        global_idxs = [sub_idx_map[_clean_id(t)] for t in task_ids]
+        global_idxs = [sub_idx_map[clean_substation_id(t)] for t in task_ids]
         pop_n = _norm01(pop_imp[global_idxs])
         hosp_n = _norm01(sub_hosp_score[global_idxs])
         svi_n = _norm01(svi_imp[global_idxs])
+        task_importance = node_importance_df.reindex([clean_substation_id(t) for t in task_ids]).fillna(0.0)
         task_times = tasks.values
 
         for policy_name, weights in cfg.GA_SCENARIOS_CONFIG.items():
-            logger.info(f"  > Running GA Policy: {policy_name} {weights}")
+            logger.debug("Running Stage 5 GA policy for %s: %s %s", scenario, policy_name, weights)
 
             W_POP, W_HOSP, W_MAKESPAN = weights["W_POP"], weights["W_HOSP"], weights["W_MAKESPAN"]
             W_SVI = getattr(cfg, "W_SVI", 0.0) if has_svi else 0.0
 
-            task_vals = W_POP * pop_n + W_HOSP * hosp_n + W_SVI * svi_n
+            task_vals_base = W_POP * pop_n + W_HOSP * hosp_n + W_SVI * svi_n
+            positive_base = task_vals_base[task_vals_base > 0]
+            s_ref = float(np.median(positive_base)) if len(positive_base) else 0.0
+            node_importance_bonus = (
+                float(getattr(cfg, "STAGE5_NODE_IMPORTANCE_ALPHA", 1.0))
+                * s_ref
+                * task_importance["node_importance_score"].values
+            )
+            task_vals = task_vals_base + node_importance_bonus
+            component_df = pd.DataFrame(
+                {
+                    "substation_id": [clean_substation_id(t) for t in task_ids],
+                    "sub_value_base": task_vals_base,
+                    "node_importance_score": task_importance["node_importance_score"].values,
+                    "node_importance_s_ref": s_ref,
+                    "node_importance_bonus": node_importance_bonus,
+                    "sub_value_final": task_vals,
+                    "importance_role_score": task_importance["importance_role_score"].values,
+                    "importance_voltage_score": task_importance["importance_voltage_score"].values,
+                    "importance_lines_score": task_importance["importance_lines_score"].values,
+                    "importance_table_matched": task_importance["importance_table_matched"].values,
+                }
+            )
+            component_df.to_csv(out_dir_s5 / f"ga_sub_value_components_{scenario}_{policy_name}.csv", index=False)
             T_MAX = float(cfg.TIME_END_HR) + float(cfg.GA_EXTRA_EVAL_HR)
 
             def eval_sched(ind):
-                clocks = np.zeros(cfg.N_CREWS)
-                locs = np.full(cfg.N_CREWS, -1, dtype=int)
+                clocks = np.zeros(n_c57_crews)
+                locs = np.full(n_c57_crews, -1, dtype=int)
                 end_times = np.zeros(n_tasks)
                 for t_idx in ind:
                     c = int(np.argmin(clocks))
@@ -2718,8 +3914,10 @@ def run_stage_5(
                 return (score,)
 
             toolbox.register("evaluate", eval_sched)
-
-            random.seed(cfg.RNG_SEED + abs(hash(scenario)) + abs(hash(policy_name)))
+            raw_seed_sum = cfg.RNG_SEED + zlib.crc32(scenario.encode()) + zlib.crc32(policy_name.encode())
+            fixed_seed = raw_seed_sum & 0xFFFFFFFF
+            random.seed(fixed_seed)
+            np.random.seed(fixed_seed)
             pop = [creator.Individual(random.sample(range(n_tasks), n_tasks)) for _ in range(cfg.GA_POP_SIZE - 2)]
             pop.append(creator.Individual(np.argsort(task_vals)[::-1].tolist()))
             pop.append(creator.Individual(np.argsort(task_times).tolist()))
@@ -2739,11 +3937,8 @@ def run_stage_5(
             # --- Export Detailed Schedule for Visualization ---
             schedule_rows = []
         
-            sim_clocks = np.zeros(cfg.N_CREWS)
-            if hasattr(cfg, "N_CREWS_LOCAL") and hasattr(cfg, "MUTUAL_AID_DELAY_HR"):
-                sim_clocks[cfg.N_CREWS_LOCAL:] = cfg.MUTUAL_AID_DELAY_HR
-            
-            sim_locs = np.full(cfg.N_CREWS, -1, dtype=int)
+            sim_clocks = np.zeros(n_c57_crews)
+            sim_locs = np.full(n_c57_crews, -1, dtype=int)
             
             for rank, t_idx in enumerate(best_ind):
                 c = int(np.argmin(sim_clocks))
@@ -2760,14 +3955,13 @@ def run_stage_5(
                 sim_clocks[c] = finish_time
                 sim_locs[c] = int(t_idx)
                 
-                r_type = "Local"
-                if hasattr(cfg, "N_CREWS_LOCAL") and c >= cfg.N_CREWS_LOCAL:
-                    r_type = "MutualAid"
+                r_type = "C57"
                 
                 schedule_rows.append({
                     "repair_order": rank + 1,
                     "substation_id": task_ids[t_idx],
                     "Crew_ID": c,           
+                    "Crew_Origin_ID": crew_origin_ids[c],
                     "Resource_Type": r_type,
                     "Start_Time": start_time,
                     "Finish_Time": finish_time,
@@ -2777,19 +3971,22 @@ def run_stage_5(
    
             out_csv_path = out_dir_s5 / f"GA_Schedule_{scenario}_{policy_name}.csv"
             pd.DataFrame(schedule_rows).to_csv(out_csv_path, index=False)
-            logger.info(f"  -> Saved detailed schedule: {out_csv_path}")
+            logger.debug("Saved detailed GA schedule: %s", out_csv_path)
 
             t_grid = np.arange(0, cfg.TIME_END_HR + cfg.DT_HR, cfg.DT_HR)
 
             R_sub = simulate_rule_schedule(
                 order=best_order,
-                n_crews=cfg.N_CREWS,
+                n_crews=n_c57_crews,
                 travel_mats=tmats,
                 t_grid=t_grid,
                 sub_repair_durations=repair_times,
                 sub_index=sub_index,
                 cfg=cfg,
-                damage_probs=damage_probs, 
+                damage_state_samples=damage_state_samples,
+                crew_origin_ids=crew_origin_ids,
+                source_gate_graph=G,
+                source_ids=source_ids,
             )
 
             # --- Export GA dynamic graph robustness (per scenario, per GA policy) ---
@@ -2822,7 +4019,14 @@ def run_stage_5(
                 kpis = kpis_from_series(S_tract, cfg.TIME_END_HR)
                 kpi_path = out_dir_s5 / f"tract_kpis_{scenario}.csv"
                 kpis.to_csv(kpi_path, index_label="tract_id")
-                logger.info(f"  -> Saved Stage 7 input: {kpi_path}")
+                logger.debug("Saved Stage 7 input: %s", kpi_path)
+
+        logger.info(
+            "Completed Stage 5 GA for %s: %d policies, %d damaged tasks.",
+            scenario,
+            len(cfg.GA_SCENARIOS_CONFIG),
+            n_tasks,
+        )
 
     # --- 5. Format Output for Stage 6 ---
     out = {"pop": {}, "svi": {}}
@@ -2889,32 +4093,6 @@ def run_stage_6(
     all_kpis: List[pd.DataFrame] = []
 
     # -------------------------------------------------------------------------
-    # 3) Plot styling
-    # -------------------------------------------------------------------------
-    # Keys must match the labels generated in steps B/C (e.g. "GA_Balanced")
-    style_config = {
-        # --- GA Policies (Stage 5) ---
-        "GA_Balanced":       ("GA (Balanced)",   "purple",      "-",  2.5, 0.9, 10),
-        "GA_HospFirst":      ("GA (HospFirst)",  "magenta",     "-",  2.0, 0.8, 9),
-        "GA_Efficiency":     ("GA (Efficiency)", "teal",        "-",  2.0, 0.8, 9),
-        
-        # --- Fallback if single policy ---
-        "GA_Best":           ("GA Optimized",    "purple",      "-",  2.5, 0.8, 10),
-
-        # --- Theoretical Limit (Stage 3) ---
-        "S3_Mean":           ("Theoretical Limit", "black",     "--", 1.8, 1.0, 11),
-
-        # --- Heuristics (Stage 4) ---
-        "centrality-first":  ("Impact λ2 (Grid)", "#e41a1c",    "-.", 1.5, 0.7, 5),
-        "betweenness-first": ("Betweenness",      "#ffd92f",    "-.", 1.5, 0.7, 5),
-        "impact-first":      ("Impact (Pop)",     "#ff7f00",    ":",  1.8, 0.7, 4),
-        "degree-first":      ("Degree (Hubs)",    "#4daf4a",    "--", 1.5, 0.7, 6),
-        "closeness-first":   ("Closeness",        "#377eb8",    "--", 1.5, 0.7, 7),
-        "hospital-first":    ("Hospital First",   "#555555",    "-",  1.5, 0.6, 3),
-        "random":            ("Random Baseline",  "lightgray",  "-",  4.0, 0.4, 1), 
-    }
-
-    # -------------------------------------------------------------------------
     # Helper: Align series to t_grid
     # -------------------------------------------------------------------------
     def _align_to_tgrid(series: pd.Series) -> pd.Series:
@@ -2930,97 +4108,6 @@ def run_stage_6(
         except Exception:
             return series
         return s
-
-    # -------------------------------------------------------------------------
-    # Helper: single-scenario plot
-    # -------------------------------------------------------------------------
-    def plot_single_scenario(scenario_name: str, data_dict: Dict[str, pd.Series], weight_type: str) -> None:
-        """
-        Plot a single scenario's recovery curves.
-        Only plots curves defined in style_config to ensure consistent legend order.
-        """
-        try:
-            sns.set_style("whitegrid")
-            sns.set_context("talk", font_scale=1.0)
-        except Exception:
-            plt.style.use("ggplot")
-
-        fig, ax = plt.subplots(figsize=(12, 8))
-
-        plotted_series: List[pd.Series] = []
-        has_plotted = False
-
-        # Plot in style_config order (controls legend order)
-        for key, (label, color, ls, lw, alpha, zorder) in style_config.items():
-            if key not in data_dict:
-                continue
-
-            series = _align_to_tgrid(data_dict[key])
-            plotted_series.append(series)
-
-            # Legend label tweaks for SVI plot
-            final_label = label
-            if weight_type == "SVI_Weighted":
-                if key == "impact-first":
-                    final_label = "Impact-First (SVI)"
-                elif key == "S3_Mean":
-                    final_label = "Theoretical Limit (SVI)"
-
-            ax.plot(
-                series.index,
-                series.values,
-                label=final_label,
-                color=color,
-                linestyle=ls,
-                linewidth=lw,
-                alpha=alpha,
-                zorder=zorder,
-            )
-            has_plotted = True
-
-        # --- Adaptive X-axis trimming ---
-        if plotted_series:
-            try:
-                df_plot = pd.concat(plotted_series, axis=1)
-                unfinished = df_plot < 0.999
-                if unfinished.any().any():
-                    last_t = unfinished.any(axis=1).iloc[::-1].idxmax()
-                    limit_t = min(cfg.TIME_END_HR, float(last_t) * 1.25)
-                    ax.set_xlim(0, limit_t)
-                else:
-                    ax.set_xlim(0, cfg.TIME_END_HR)
-            except Exception:
-                ax.set_xlim(0, cfg.TIME_END_HR)
-        else:
-            ax.set_xlim(0, cfg.TIME_END_HR)
-
-        suffix = " (SVI Weighted)" if weight_type == "SVI_Weighted" else " (Population Weighted)"
-        ax.set_title(
-            f"System Recovery: {scenario_name}{suffix}",
-            fontsize=18,
-            fontweight="bold",
-            pad=15,
-        )
-
-        y_label = "Functionality" if weight_type == "Population" else "SVI-Weighted Recovery"
-        ax.set_ylabel(y_label, fontsize=16)
-        ax.set_xlabel("Time (Hours)", fontsize=16)
-        ax.set_ylim(-0.02, 1.05)
-        ax.tick_params(axis="both", labelsize=14)
-
-        if has_plotted:
-            # Move legend outside if too crowded, or keep inside top-left/right
-            leg = ax.legend(loc="lower right", framealpha=0.95, fontsize=12, ncol=1)
-            if leg.get_title() is not None:
-                leg.get_title().set_fontsize(12)
-
-        ax.grid(True, linestyle="--", alpha=0.6)
-
-        filename = f"recovery_curve_{scenario_name}_{weight_type}.png"
-        plt.tight_layout()
-        plt.savefig(out_dir / filename, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        logger.info(f"Saved plot: {filename}")
 
     # -------------------------------------------------------------------------
     # 4) Main loop: consolidate per scenario
@@ -3147,17 +4234,6 @@ def run_stage_6(
                         kpis_svi["rule"] = f"Stage5_{label}_SVI"
                         all_kpis.append(kpis_svi)
 
-        # ---------------------------------------------------------------------
-        # D) Plotting
-        # ---------------------------------------------------------------------
-        if current_pop_curves:
-            plot_single_scenario(scenario, current_pop_curves, "Population")
-        else:
-            logger.warning(f"No population curves found for {scenario}, skipping plot.")
-
-        if current_svi_curves and svi_pop_weights is not None:
-            plot_single_scenario(scenario, current_svi_curves, "SVI_Weighted")
-
     # -------------------------------------------------------------------------
     # 5) Write consolidated outputs
     # -------------------------------------------------------------------------
@@ -3174,7 +4250,7 @@ def run_stage_6(
 
 
 # ==========================================================================
-# [PART 8] Stage 7: Typology Clustering (PCA + K-Means)
+# [PART 8] Stage 7: Typology Clustering (K-Means + PCA Diagnostics)
 # =============================================================================
 # Contains: Feature Engineering, PCA, K-Means Clustering, run_stage_8
 def run_stage_7(
@@ -3190,7 +4266,7 @@ def run_stage_7(
 
     logger = logging.getLogger()
     logger.info("=" * 50)
-    logger.info("--- STAGE 7: PCA + K-Means (Final Enhanced) ---")
+    logger.info("--- STAGE 7: K-Means + PCA Diagnostics (Final Enhanced) ---")
     out_dir = out_dirs["STAGE7_DIR"]
 
     # =========================================================
@@ -3231,11 +4307,11 @@ def run_stage_7(
     df_s5["scenario"] = target_scen
 
     # Ensure KPI columns exist (defensive)
-    for c in ["T50", "T80", "AUC"]:
+    for c in ["T50", "T80"]:
         if c not in df_s5.columns:
             df_s5[c] = 0.0
 
-    df_main_raw = df_s5[["tract_id", "scenario", "T50", "T80", "AUC"]].copy()
+    df_main_raw = df_s5[["tract_id", "scenario", "T50", "T80"]].copy()
 
     # ---------------------------------------------------------
     # B. Initial Supply (from Stage 1 MC) - single scenario
@@ -3266,13 +4342,14 @@ def run_stage_7(
     # Aggregation (keep mean for safety; single-scenario -> identity)
     # ---------------------------------------------------------
     df_main = (
-        df_main_raw.groupby("tract_id")[["T50", "T80", "AUC", "Init_Supply"]]
+        df_main_raw.groupby("tract_id")[["T50", "T80", "Init_Supply"]]
         .mean()
         .reset_index()
     )
 
     # Standardize tract_id: keep digits only, drop decimal suffix, strip leading zeros
     df_main["tract_id"] = _normalize_tract_id(df_main["tract_id"])
+    df_main["scenario"] = target_scen
 
     # ---------------------------------------------------------
     # C. Grid Centrality & Network Structure Features
@@ -3281,8 +4358,8 @@ def run_stage_7(
     mapping_df = stage_0_data.get("mapping_df", None)
 
     # Default values
-    df_main["Grid_Centrality"] = 0.0
-    df_main["Grid_ImpactLambda2"] = 0.0
+    df_main["Grid_Degree"] = 0.0
+    df_main["Grid_Impact"] = 0.0
     df_main["Grid_Betweenness"] = 0.0
     df_main["Redundancy_HHI"] = np.nan
 
@@ -3300,7 +4377,7 @@ def run_stage_7(
             if sub_col is None:
                 sub_col = df_cent.columns[0]
 
-            df_cent[sub_col] = df_cent[sub_col].astype(str).str.strip()
+            df_cent[sub_col] = df_cent[sub_col].map(clean_substation_id)
             df_cent = df_cent.set_index(sub_col)
 
             # Centrality column names
@@ -3317,7 +4394,7 @@ def run_stage_7(
             m = mapping_df.copy()
             # IMPORTANT: use the same tract_id normalization as df_main
             m["tract_id"] = _normalize_tract_id(m["tract_id"])
-            m["substation_id"] = m["substation_id"].astype(str).str.strip()
+            m["substation_id"] = m["substation_id"].map(clean_substation_id)
 
             join_cols = [deg_col]
             if bet_col:
@@ -3341,17 +4418,17 @@ def run_stage_7(
 
             g = m.groupby("tract_id")
 
-            # 1) Grid_Centrality: mean degree
+            # 1) Grid_Degree: mean degree
             if "deg" in m.columns:
                 grid_deg = g["deg"].mean()
-                df_main["Grid_Centrality"] = (
+                df_main["Grid_Degree"] = (
                     df_main["tract_id"].map(grid_deg).fillna(0.0)
                 )
 
-            # 2) Grid_ImpactLambda2: mean impact_centrality
+            # 2) Grid_Impact: mean lambda2-loss impact_centrality
             if "imp" in m.columns:
                 grid_imp = g["imp"].mean()
-                df_main["Grid_ImpactLambda2"] = (
+                df_main["Grid_Impact"] = (
                     df_main["tract_id"].map(grid_imp).fillna(0.0)
                 )
 
@@ -3567,7 +4644,6 @@ def run_stage_7(
                 "tract_id",
                 "BUILDVALUE",
                 "RISK_SCORE",
-                "EAL_SCORE",
                 "POPULATION",
                 "AREA",
             ]
@@ -3589,8 +4665,6 @@ def run_stage_7(
             rename_map = {}
             if "RISK_SCORE" in df_nri.columns:
                 rename_map["RISK_SCORE"] = "NRI_RISK_SCORE"
-            if "EAL_SCORE" in df_nri.columns:
-                rename_map["EAL_SCORE"] = "NRI_EAL_SCORE"
             if "RESL_SCORE" in df_nri.columns:
                 rename_map["RESL_SCORE"] = "NRI_RESL_SCORE"
             if "BUILDVALUE" in df_nri.columns:
@@ -3604,7 +4678,6 @@ def run_stage_7(
             # Median-fill NRI-related missing values (BUILDVALUE not logged)
             for col in [
                 "NRI_RISK_SCORE",
-                "NRI_EAL_SCORE",
                 "NRI_BUILDVALUE",
                 "NRI_Pop_Density",
             ]:
@@ -3662,27 +4735,81 @@ def run_stage_7(
     else:
         df_main["Pre_1970_Ratio"] = 0
 
+    # ---------------------------------------------------------
+    # G. Compound slow-vulnerable hotspot score
+    # ---------------------------------------------------------
+    svi_cols_for_hotspot = [
+        c
+        for c in ["SVI_THEME1", "SVI_THEME2", "SVI_THEME3", "SVI_THEME4"]
+        if c in df_main.columns
+    ]
+    if svi_cols_for_hotspot:
+        df_main["Hotspot_SVI_Score"] = df_main[svi_cols_for_hotspot].mean(axis=1)
+    elif "SVI_SCORE" in df_main.columns:
+        df_main["Hotspot_SVI_Score"] = pd.to_numeric(df_main["SVI_SCORE"], errors="coerce")
+    else:
+        df_main["Hotspot_SVI_Score"] = np.nan
+
+    def _rank_pct_component(source_col: str, out_col: str) -> bool:
+        vals = pd.to_numeric(df_main.get(source_col), errors="coerce")
+        vals = vals.replace([np.inf, -np.inf], np.nan)
+        if vals.notna().sum() == 0 or vals.nunique(dropna=True) <= 1:
+            df_main[out_col] = 0.0
+            return False
+        df_main[out_col] = vals.rank(pct=True, method="average").fillna(0.0)
+        return True
+
+    hotspot_component_defs = [
+        ("T80", "Hotspot_T80_RankPct"),
+        ("Pre_1970_Ratio", "Hotspot_Pre1970_RankPct"),
+        ("NRI_RISK_SCORE", "Hotspot_NRI_Risk_RankPct"),
+        ("Hotspot_SVI_Score", "Hotspot_SVI_RankPct"),
+    ]
+    hotspot_rank_cols = []
+    for source_col, out_col in hotspot_component_defs:
+        if source_col in df_main.columns and _rank_pct_component(source_col, out_col):
+            hotspot_rank_cols.append(out_col)
+
+    if hotspot_rank_cols:
+        df_main["SlowVulnerable_Hotspot_Score"] = df_main[hotspot_rank_cols].sum(axis=1)
+        df_main["SlowVulnerable_Hotspot_Rank"] = (
+            df_main["SlowVulnerable_Hotspot_Score"]
+            .rank(method="first", ascending=False)
+            .astype(int)
+        )
+    else:
+        logger.warning("Stage 7 hotspot score: no usable component columns found.")
+        df_main["SlowVulnerable_Hotspot_Score"] = 0.0
+        df_main["SlowVulnerable_Hotspot_Rank"] = np.arange(1, len(df_main) + 1)
+
+    hotspot_top_n = int(getattr(cfg, "STAGE7_HOTSPOT_TOP_N", 10))
+    df_main["SlowVulnerable_Hotspot_Top10"] = (
+        df_main["SlowVulnerable_Hotspot_Rank"] <= hotspot_top_n
+    )
+
     # =========================================================
-    # 2. PCA & Clustering
+    # 2. Clustering and PCA diagnostics
     # =========================================================
+    # Avoid double-counting near-duplicate dimensions in the Stage 7
+    # typology table. AUC is almost a monotone inverse of T80, and
+    # NRI_EAL_SCORE closely tracks NRI_RISK_SCORE for this tract universe, so
+    # keep the more interpretable representative from each pair.
     feat_cols = [
         "T80",
-        "AUC",
         "Init_Supply",
-        "Grid_Centrality",
-        "Grid_ImpactLambda2",
+        "Grid_Degree",
+        "Grid_Impact",
         "Grid_Betweenness",
         "Redundancy_HHI",
         "Pre_1970_Ratio",
         "Pop_Density",
         "NRI_RISK_SCORE",
-        "NRI_EAL_SCORE",
         "NRI_BUILDVALUE",
     ] + svi_factor_cols  # svi_factor_cols is either the theme list or []
 
     # Filter out invalid/constant columns
     valid_cols = [c for c in feat_cols if c in df_main.columns and df_main[c].std() > 1e-6]
-    logger.info(f"Clustering on {len(valid_cols)} features: {valid_cols}")
+    logger.info(f"KMeans clustering on {len(valid_cols)} standardized features: {valid_cols}")
 
     X = df_main[valid_cols].values
     X_scaled = StandardScaler().fit_transform(X)
@@ -3721,23 +4848,9 @@ def run_stage_7(
         columns=[f"PC{i+1}" for i in range(n_components)],
     ).to_csv(out_dir / "pca_loadings.csv")
 
-    # Additional scree plot (preserved behavior)
-    plt.figure(figsize=(10, 6))
-    pc_range = range(1, len(eigenvalues) + 1)
-    plt.plot(pc_range, eigenvalues, "bo-", linewidth=2, markersize=8, label="Eigenvalue")
-    plt.axhline(y=1, color="r", linestyle="--", linewidth=2, label="Kaiser Criterion (Ev=1)")
-    plt.title("PCA Scree Plot")
-    plt.xlabel("Principal Component")
-    plt.ylabel("Eigenvalue")
-    plt.xticks(pc_range)
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_dir / "pca_scree_plot.png", dpi=300)
-    plt.close()
-    logger.info("Saved pca_scree_plot.png")
-
-    # 2.3 K-Means Clustering (Elbow + Silhouette)
+    # 2.3 K-Means Clustering (Elbow + Silhouette) on standardized features.
+    # PCA is retained for diagnostics/visualization, but it is not the
+    # clustering feature space.
     from sklearn.metrics import silhouette_score
 
     Ks = list(range(1, 11))
@@ -3746,12 +4859,12 @@ def run_stage_7(
 
     for k in Ks:
         km = KMeans(n_clusters=k, random_state=cfg.RNG_SEED, n_init=10)
-        labels = km.fit_predict(X_pca)
+        labels = km.fit_predict(X_scaled)
         iners.append(km.inertia_)
 
         if k >= 2:
             # silhouette needs at least 2 clusters
-            sils.append(silhouette_score(X_pca, labels))
+            sils.append(silhouette_score(X_scaled, labels))
         else:
             sils.append(np.nan)
 
@@ -3770,7 +4883,7 @@ def run_stage_7(
     else:
         sil_best_k = elbow_k  # fallback
 
-    # Combine rule: prefer silhouette, but keep elbow as sanity check
+    # Combine
     best_k = int(elbow_k)
 
     logger.info(f" > Elbow best k = {elbow_k}")
@@ -3778,16 +4891,47 @@ def run_stage_7(
     logger.info(f" > Selected Best k (Clusters) = {best_k}")
 
     # Optional: save a small CSV for debugging/record
-    df_kdiag = pd.DataFrame({"k": Ks, "inertia": iners, "silhouette": sils})
+    df_kdiag = pd.DataFrame(
+        {
+            "k": Ks,
+            "inertia": iners,
+            "silhouette": sils,
+            "feature_space": "standardized_original_features",
+        }
+    )
     df_kdiag.to_csv(out_dir / "kmeans_k_diagnostics.csv", index=False)
 
     # Final clustering
     kmeans = KMeans(n_clusters=best_k, random_state=cfg.RNG_SEED, n_init=10)
-    df_main["cluster"] = kmeans.fit_predict(X_pca)
+    df_main["cluster"] = kmeans.fit_predict(X_scaled)
 
-    # Append selected PC scores to df_main
+    # Append selected PC scores for visualization/interpretation only.
     for i in range(n_components):
         df_main[f"PC{i+1}"] = X_pca[:, i]
+
+    hotspot_detail_cols = [
+        "tract_id",
+        "scenario",
+        "cluster",
+        "SlowVulnerable_Hotspot_Rank",
+        "SlowVulnerable_Hotspot_Score",
+        "T80",
+        "Pre_1970_Ratio",
+        "NRI_RISK_SCORE",
+        "Hotspot_SVI_Score",
+        "Hotspot_T80_RankPct",
+        "Hotspot_Pre1970_RankPct",
+        "Hotspot_NRI_Risk_RankPct",
+        "Hotspot_SVI_RankPct",
+        "T50",
+        "Init_Supply",
+    ]
+    hotspot_detail_cols = [c for c in hotspot_detail_cols if c in df_main.columns]
+    (
+        df_main.sort_values("SlowVulnerable_Hotspot_Rank")
+        .head(hotspot_top_n)[hotspot_detail_cols]
+        .to_csv(out_dir / "stage7_top10_slow_vulnerable_tracts.csv", index=False)
+    )
 
     # Keep only intended output columns
     cols_keep = [
@@ -3796,10 +4940,9 @@ def run_stage_7(
         "cluster",
         "T50",
         "T80",
-        "AUC",
         "Init_Supply",
-        "Grid_Centrality",
-        "Grid_ImpactLambda2",
+        "Grid_Degree",
+        "Grid_Impact",
         "Grid_Betweenness",
         "Redundancy_HHI",
         "Pre_1970_Ratio",
@@ -3810,73 +4953,12 @@ def run_stage_7(
         "SVI_THEME4",
         "NRI_BUILDVALUE",
         "NRI_RISK_SCORE",
-        "NRI_EAL_SCORE",
     ] + [f"PC{i+1}" for i in range(n_components)]
 
     cols_keep = [c for c in cols_keep if c in df_main.columns]
     df_main = df_main[cols_keep]
 
     df_main.to_csv(out_dir / "clusters_labels_final.csv", index=False)
-
-    # =========================================================
-    # 3. Visualization
-    # =========================================================
-    try:
-        # Elbow plot
-        plt.figure(figsize=(8, 6))
-        plt.plot(range(1, 11), iners, "bo-")
-        plt.plot([best_k], [iners[best_k - 1]], "rx", markersize=12)
-        plt.title(f"Elbow Method (k={best_k})")
-        plt.xlabel("Number of clusters (k)")
-        plt.ylabel("Inertia (within-cluster SSE)")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(out_dir / "elbow_curve_analysis.png", dpi=300)
-        plt.close()
-
-        # Scatter plot (PC1 vs PC2)
-        if n_components >= 2:
-            plt.figure(figsize=(10, 8))
-            sns.scatterplot(
-                x="PC1",
-                y="PC2",
-                hue="cluster",
-                data=df_main,
-                palette="viridis",
-                s=50,
-                alpha=0.7,
-            )
-            plt.title(f"Tract Typology (k={best_k})")
-            plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%})")
-            plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%})")
-            plt.grid(True, linestyle=":", alpha=0.6)
-            plt.savefig(out_dir / "pca_kmeans_scatter.png", dpi=300)
-            plt.close()
-            logger.info("Saved pca_kmeans_scatter.png")
-
-        # 3D scatter (PC1 vs PC2 vs PC3)
-        if n_components >= 3:
-            from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-
-            fig = plt.figure(figsize=(10, 8))
-            ax = fig.add_subplot(111, projection="3d")
-
-            for cl in sorted(df_main["cluster"].dropna().unique()):
-                sub = df_main[df_main["cluster"] == cl]
-                ax.scatter(sub["PC1"], sub["PC2"], sub["PC3"], s=18, alpha=0.6, label=f"{cl}")
-
-            ax.set_title(f"3D PCA Scatter (k={best_k})")
-            ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%})")
-            ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%})")
-            ax.set_zlabel(f"PC3 ({pca.explained_variance_ratio_[2]:.1%})")
-            ax.legend(title="cluster", loc="best")
-            plt.tight_layout()
-            plt.savefig(out_dir / "pca_kmeans_scatter_3d.png", dpi=300)
-            plt.close()
-            logger.info("Saved pca_kmeans_scatter_3d.png")
-
-    except Exception as e:
-        logger.warning(f"Plotting failed: {e}")
 
     logger.info("--- STAGE 7 Complete ---")
     return {"clusters": df_main}
@@ -3885,8 +4967,8 @@ def run_stage_7(
 # ==========================================================================
 # [PART 9] Main Execution Pipeline
 # =============================================================================
-# Contains: main() orchestration function and entry point
-def main() -> None:
+# Contains: run_pipeline()/main() orchestration functions and entry point
+def run_pipeline(cfg: Optional[Config] = None) -> None:
     """
     Orchestrate the end-to-end pipeline.
 
@@ -3899,17 +4981,17 @@ def main() -> None:
       5) GA scheduling (disabled)
       6) Consolidation & KPI plotting
       7) Replica OD flow & accessibility analysis (optional; currently disabled)
-      8) Tract typology clustering (PCA + K-Means)
+      8) Tract typology clustering (K-Means + PCA diagnostics)
     """
     # ---------------------------------------------------------------------
     # 1) Configuration & setup
     # ---------------------------------------------------------------------
-    cfg = Config()
+    cfg = cfg if cfg is not None else Config()
 
     root_override = Path(OUTPUT_ROOT)
     root_override.mkdir(parents=True, exist_ok=True)
 
-    log_file = root_override / "pipeline_run.log"
+    log_file = root_override / getattr(cfg, "PIPELINE_LOG_FILENAME", "pipeline_run.log")
     logger = setup_logging(log_file)
 
     logger.info("=" * 70)
@@ -3968,7 +5050,7 @@ def main() -> None:
             out_dirs,
         )
 
-        # Stage 7: Tract typology clustering (PCA + K-Means)
+        # Stage 7: Tract typology clustering (K-Means + PCA diagnostics)
         run_stage_7(
             cfg,
             stage_3_data,
@@ -3990,6 +5072,11 @@ def main() -> None:
         logger.info("PIPELINE TERMINATED WITH ERROR")
         logger.info("=" * 70)
         sys.exit(1)
+
+
+def main() -> None:
+    """Run the integrated earthquake-impact pipeline with the default config."""
+    run_pipeline(Config())
 
 
 if __name__ == "__main__":

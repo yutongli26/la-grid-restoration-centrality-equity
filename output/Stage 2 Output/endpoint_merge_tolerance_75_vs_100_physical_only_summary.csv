@@ -1,0 +1,3 @@
+merge_tolerance_m,lines_after_merge,lines_after_split,split_cut_points,physical_nodes,physical_edges,physical_components,physical_largest_component,physical_second_component,physical_isolates,physical_max_degree,physical_edges_gt20km,physical_edges_gt25km
+75,1952,1977,25,64634,66895,41,63348,451,0,24,0,0
+100,1952,1977,25,64605,66886,39,63526,451,0,24,0,0

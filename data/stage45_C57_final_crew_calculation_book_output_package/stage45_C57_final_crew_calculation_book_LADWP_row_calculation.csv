@@ -1,0 +1,8 @@
+row_id,layer,category,source_rows,raw_positions,role_weight,weighted_personnel,active_conversion,allocation_ratio,crew_size,effective_crews_before_allocation,effective_crews_after_allocation
+DWP-L1-01,LADWP L1 direct repair core,direct_substation_electrical_craft,Senior Electrical Mechanic 109 + Electrical Mechanic 318,427,1.00,427.000000,0.28,0.833333333,4.5,26.568889,22.140741
+DWP-L1-02,LADWP L1 direct repair core,direct_substation_test,Electrical Test Technician 148 + Senior Electrical Test Technician 35,183,1.00,183.000000,0.28,0.833333333,4.5,11.386667,9.488889
+DWP-L1-03,LADWP L1 direct repair core,direct_substation_electrical_supervision,Electrical Mechanic Supervisor 90 + Sr Electrical Mechanic Supervisor 252 + Electrical Test Tech Supervisor 19 + Electrical Repair Supervisor 1 + Sr Electrical Repair Supervisor 1,363,0.60,217.800000,0.28,0.833333333,4.5,13.552000,11.293333
+DWP-L1-04,LADWP L1 direct repair core,direct_controls_instrument_craft,Instrument Mechanic 47,47,0.80,37.600000,0.28,0.833333333,4.5,2.339556,1.949630
+DWP-L1-05,LADWP L1 direct repair core,direct_general_electrical_craft,Electrician 56,56,0.50,28.000000,0.28,0.833333333,4.5,1.742222,1.451852
+DWP-L1-06,LADWP L1 direct repair core,direct_station_auxiliary_craft,Battery Technician 5,5,0.80,4.000000,0.28,0.833333333,4.5,0.248889,0.207407
+DWP-L1-07,LADWP L1 direct repair core,direct_controls_instrument_supervision,Instrument Mechanic Supervisor 10,10,0.50,5.000000,0.28,0.833333333,4.5,0.311111,0.259259

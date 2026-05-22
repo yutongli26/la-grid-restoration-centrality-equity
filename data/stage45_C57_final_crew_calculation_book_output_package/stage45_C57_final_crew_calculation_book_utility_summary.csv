@@ -1,0 +1,4 @@
+scenario_label,utility,weighted_denominator,active_conversion,allocation_ratio,allocation_basis,crew_size,exact_effective_crews,integer_crews_for_yard_allocation,status
+C57_substation_ratio_main,LADWP,902.400000,0.28,0.833333333,35 study-area LADWP 66kV+ substations / 42 utility-wide LADWP 66kV+ substations,4.5,46.791111,47,final main utility input
+C57_substation_ratio_main,SCE,509.119257,0.28,0.319293478,235 study-area SCE 66kV+ substations / 736 utility-wide SCE 66kV+ substations,4.5,10.114749,10,final main utility input
+C57_substation_ratio_main,TOTAL,,,,LADWP + SCE,,56.905860,57,final integer Stage 4/5 scheduling input
